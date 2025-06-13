@@ -48,6 +48,7 @@ import Data.Array.Accelerate.LLVM.CodeGen.Environment hiding ( Empty )
 import Data.Array.Accelerate.LLVM.CodeGen.Cluster
 import Data.Array.Accelerate.LLVM.CodeGen.Loop (imapFromStepTo)
 import Data.Array.Accelerate.LLVM.CodeGen.Default
+import Data.Array.Accelerate.LLVM.CodeGen.Profile
 import Data.Array.Accelerate.LLVM.Native.Operation
 import Data.Array.Accelerate.LLVM.Native.CodeGen.Base
 import Data.Array.Accelerate.LLVM.Native.Target
@@ -346,6 +347,8 @@ initShards
   -> Operands Word64 -- Amount of tiles to be divided over the shards
   -> CodeGen Native ()
 initShards shardIndexes shardSizes tileCount = do
+  zone <- zone_begin 349 "CodeGen.hs" "initShards" "initShardsZone" 0xff0000
+
   shardAmount' <- A.min singleType (A.liftWord64 shardAmount) tileCount
   
   (OP_Word64 shardMinSize, remainder) <- A.unpair <$> A.quotRem TypeWord64 tileCount shardAmount'
@@ -372,6 +375,8 @@ initShards shardIndexes shardSizes tileCount = do
     _ <- instr' $ Store NonVolatile shardSizeArray shard
     return ()
     )
+
+  zone_end zone
     
 
       

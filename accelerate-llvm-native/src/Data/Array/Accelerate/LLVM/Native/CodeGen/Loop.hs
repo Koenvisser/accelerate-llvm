@@ -28,6 +28,7 @@ import Data.Array.Accelerate.LLVM.CodeGen.Constant
 import Data.Array.Accelerate.LLVM.CodeGen.Exp
 import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.CodeGen.Monad
+import Data.Array.Accelerate.LLVM.CodeGen.Profile
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Loop            as Loop
 
 import Data.Array.Accelerate.LLVM.Native.Target                     ( Native )
@@ -198,6 +199,7 @@ shardedSelfScheduling shardIndexes shardSizes nextShard finishedShards tileCount
   finish   <- newBlock "workassist.shards.finish"
   exit     <- newBlock "workassist.exit"
 
+  zone <- zone_begin 201 "Loop.hs" "shardedSelfScheduling" "shardedSelfSchedulingZone" 0xff0000
   -- TODO: Reuse from init
   shardAmount' <- A.min singleType (A.liftWord64 shardAmount) (OP_Word64 tileCount)
   _ <- br start
@@ -250,6 +252,7 @@ shardedSelfScheduling shardIndexes shardSizes nextShard finishedShards tileCount
   _ <- br start
 
   setBlock exit
+  zone_end zone
   retval_ $ scalar (scalarType @Word8) 0
 
 shardedSelfSchedulingChunked 
@@ -287,6 +290,8 @@ workassistLoop counter size doWork = do
   exit     <- newBlock "workassist.exit"
   finished <- newBlock "workassist.finished"
 
+  zone <- zone_begin 293 "Loop.hs" "workassistLoop" "workassistLoopZone" 0xff0000
+
   firstIndex <- atomicAdd Monotonic counter (integral TypeWord64 1)
 
   initialCondition <- lt singleType (OP_Word64 firstIndex) (OP_Word64 size)
@@ -321,6 +326,7 @@ workassistLoop counter size doWork = do
   cbr condition work exit
 
   setBlock exit
+  zone_end zone
   retval_ $ scalar (scalarType @Word8) 0
 
 workassistChunked :: [Loop.LoopAnnotation] -> ShapeR sh -> Operand (Ptr Word64) -> sh -> Operands sh -> (Operands sh -> CodeGen Native ()) -> CodeGen Native ()
