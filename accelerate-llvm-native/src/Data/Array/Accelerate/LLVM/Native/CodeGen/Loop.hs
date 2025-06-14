@@ -199,19 +199,25 @@ shardedSelfScheduling shardIndexes shardSizes nextShard finishedShards tileCount
   finish   <- newBlock "workassist.shards.finish"
   exit     <- newBlock "workassist.exit"
 
-  zone <- zone_begin 201 "Loop.hs" "shardedSelfScheduling" "shardedSelfSchedulingZone" 0xff0000
+  zone <- zone_begin 202 "Loop.hs" "shardedSelfScheduling" "shardedSelfScheduling" 0x0000ff
   -- TODO: Reuse from init
   shardAmount' <- A.min singleType (A.liftWord64 shardAmount) (OP_Word64 tileCount)
   _ <- br start
 
   setBlock start
 
+  startZone <- zone_begin 209 "Loop.hs" "shardSelfSchedulingStart" "shardSelfSchedulingStart" 0x0000ff
+
   finishCount <- atomicLoad Monotonic finishedShards
   finished <- A.lt singleType (OP_Word64 finishCount) shardAmount'
+
+  zone_end startZone 
 
   _ <- cbr finished outer exit
 
   setBlock outer
+
+  outerZone <- zone_begin 220 "Loop.hs" "shardSelfSchedulingOuter" "shardSelfSchedulingOuter" 0x0000ff
 
   next <- atomicAdd Monotonic nextShard (integral TypeWord64 1)
   OP_Word64 shardToWorkOn <- A.rem TypeWord64 (OP_Word64 next) shardAmount'
@@ -222,32 +228,50 @@ shardedSelfScheduling shardIndexes shardSizes nextShard finishedShards tileCount
   shardSizeIdx <- instr' $ GetElementPtr $ GEP shardSizes (integral TypeWord64 0) $ GEPArray shardToWorkOn GEPEmpty
   shardSize <- instr' $ Load scalarType NonVolatile shardSizeIdx
 
+  zone_end outerZone
+
   _ <- br inner
 
   setBlock inner
+
+  innerZone <- zone_begin 237 "Loop.hs" "shardSelfSchedulingInner" "shardSelfSchedulingInner" 0x0000ff
   
   workIdx <- atomicAdd Monotonic shard (integral TypeWord64 1)
   shardFinished <- A.lt singleType (OP_Word64 workIdx) (OP_Word64 shardSize)
+
+  zone_end innerZone
 
   _ <- cbr shardFinished work done
 
   setBlock work
 
+  workZone <- zone_begin 248 "Loop.hs" "shardSelfSchedulingWork" "shardSelfSchedulingWork" 0x0000ff
+
   -- Sequential mode needs to be false here, as it is only used in 
   -- a scan operation and this scheduler is never used for scans
   doWork (boolean False) workIdx
+
+  zone_end workZone
 
   _ <- br inner
 
   setBlock done
 
+  doneZone <- zone_begin 260 "Loop.hs" "shardSelfSchedulingDone" "shardSelfSchedulingDone" 0x0000ff
+
   incrementFinished <- A.eq singleType (OP_Word64 workIdx) (OP_Word64 shardSize)
+
+  zone_end doneZone
 
   _ <- cbr incrementFinished finish start
   
   setBlock finish
 
+  finishZone <- zone_begin 270 "Loop.hs" "shardSelfSchedulingFinish" "shardSelfSchedulingFinish" 0x0000ff
+
   _ <- atomicAdd Monotonic finishedShards (integral TypeWord64 1)
+
+  zone_end finishZone
 
   _ <- br start
 
@@ -290,15 +314,23 @@ workassistLoop counter size doWork = do
   exit     <- newBlock "workassist.exit"
   finished <- newBlock "workassist.finished"
 
-  zone <- zone_begin 293 "Loop.hs" "workassistLoop" "workassistLoopZone" 0xff0000
+  zone <- zone_begin 317 "Loop.hs" "workassistLoop" "workassistLoop" 0xff0000
+
+  initialZone <- zone_begin 319 "Loop.hs" "workassistInitial" "workassistInitial" 0xff0000
 
   firstIndex <- atomicAdd Monotonic counter (integral TypeWord64 1)
 
   initialCondition <- lt singleType (OP_Word64 firstIndex) (OP_Word64 size)
   initialSeq <- eq singleType (OP_Word64 firstIndex) (liftWord64 0)
+
+  zone_end initialZone
+
   _ <- cbr initialCondition work exit
 
   _ <- setBlock work
+
+  workZone <- zone_begin 332 "Loop.hs" "workassistWork" "workassistWork" 0xff0000
+
   let indexName = "block_index"
   -- Whether the thread should operate in the single threaded mode of
   -- zero-overhead parallel scans.
@@ -307,6 +339,10 @@ workassistLoop counter size doWork = do
   let index = LocalReference type' indexName
 
   doWork seqMode index
+
+  zone_end workZone
+
+  incZone <- zone_begin 345 "Loop.hs" "workassistInc" "workassistInc" 0xff0000
 
   nextIndex <- atomicAdd Monotonic counter (integral TypeWord64 1)
   condition <- lt singleType (OP_Word64 nextIndex) (OP_Word64 size)
@@ -322,6 +358,8 @@ workassistLoop counter size doWork = do
   currentBlock <- getBlock
   phi1 work indexName [(firstIndex, entry), (nextIndex, currentBlock)]
   phi1 work seqName [(op BoolPrimType initialSeq, entry), (op BoolPrimType nextSeq, currentBlock)]
+
+  zone_end incZone
 
   cbr condition work exit
 
