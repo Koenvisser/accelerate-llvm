@@ -72,6 +72,10 @@ import Data.Array.Accelerate.LLVM.Native.CodeGen.Loop
 import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.CodeGen.Constant
 import qualified Text.LLVM as LP
+import GHC.IO (unsafePerformIO)
+import GHC.Conc (getNumProcessors)
+import System.Environment (lookupEnv)
+import Text.Read (readMaybe)
 
 codegen :: String
         -> Env AccessGroundR env
@@ -107,18 +111,52 @@ codegen name env cluster args
         Nothing -> internalError "Could not generate code for a cluster. Does parCodeGen lack a case for a collective parallel operation?"
         Just (Exists parCodes) -> do
           let hasScan = parCodeGenHasMultipleTileLoops parCodes
-          let tileSize =
+          let maxTileSize = if hasScan then 1024 * 2 else 1024 * 1024
+          let threads = fromIntegral $ unsafePerformIO threadCount :: Int
+          let tileSize :: Operands Int -> Operands Int -> Operands Int -> CodeGen Native (Operands Int)
+              tileSize tileIdx iterCount tileCount =
                 if rank shr > 1 then
-                  32
+                  return $ A.liftInt 32
                 else if hasScan then
                   -- We need to choose a tile size such that the values in the
                   -- first tile loop (the reduce step of the chained scan) are
                   -- still in the cache during the second tile loop (the scan
                   -- step of the chained scan).
-                  1024 * 2
-                else
-                  1024 * 16 -- TODO: Implement a better heuristic to choose the tile size
+                  return $ A.liftInt $ 1024 * 2
+                else do
+                  -- decr = (f - l) / (N - 1)
+                  -- tileSize = f - decr * tileIdx
+                  f <- A.quot TypeInt iterCount (A.liftInt $ 2 * threads)
+                  f' <- A.min singleType f (A.liftInt maxTileSize)
+                  let l = A.liftInt 1
+                  numerator <- A.sub numType f' l
+                  denom <- A.sub numType (A.liftInt 1) tileCount
+                  decrStep <- A.quot TypeInt numerator denom
+                  decr <- A.mul numType decrStep tileIdx
+                  A.sub numType f' decr
+                  
+                  
 
+          let tileCount :: Operands Int -> CodeGen Native (Operands Int)
+              tileCount iterCount = 
+                if rank shr > 1 then do
+                  let tileSize' = A.liftInt 32
+                  sizeAdd <- A.add numType iterCount (A.liftInt $ 32 - 1)
+                  A.quot TypeInt sizeAdd tileSize'
+                else if hasScan then do
+                  let tileSize' = A.liftInt $ 1024 * 2
+                  sizeAdd <- A.add numType iterCount (A.liftInt $ (1024 * 2) - 1)
+                  A.quot TypeInt sizeAdd tileSize'
+                else do
+                  -- N = 2 * I / (f + l)
+                  -- f = I / 2 * threads, l = 1
+                  f <- A.quot TypeInt iterCount (A.liftInt $ 2 * threads)
+                  f' <- A.min singleType f (A.liftInt maxTileSize)
+                  let l = A.liftInt 1
+                  numerator <- A.mul numType (A.liftInt 2) iterCount
+                  denom <- A.add numType f' l
+                  A.quot TypeInt numerator denom
+                 
           let envs' = envs{
             envsLoopDepth = 0,
             envsDescending = isDescending direction
@@ -132,8 +170,10 @@ codegen name env cluster args
           setBlock initBlock
           do
             -- Number of tiles
-            sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
-            OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
+            -- sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
+            -- OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
+
+            OP_Int tileCount' <- tileCount size
 
             -- Initialize kernel memory
             parCodeGenInitMemory kernelMem envs' TupleIdxSelf parCodes
@@ -156,9 +196,13 @@ codegen name env cluster args
 
           setBlock workBlock
           -- Number of tiles
-          sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
-          OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
-          tileCount <- instr' $ BitCast scalarType tileCount'
+          -- sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
+          -- OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
+          -- tileCount <- instr' $ BitCast scalarType tileCount'
+
+          OP_Int tileCount' <- tileCount size
+          tileCountWord64 <- instr' $ BitCast scalarType tileCount'
+
 
           -- Emit code to initialize a thread, and get the codes for the tile loops
           tileLoops <- genParallel kernelMem envs' TupleIdxSelf parCodes
@@ -169,9 +213,11 @@ codegen name env cluster args
           -- TODO: We can make this more precise by tracking whether arrays are
           -- only used in one tile loop. These arrays can also be stored as a
           -- single value.
-          envs'' <- bindLocalsInTile (\_ -> not $ null $ ptOtherLoops tileLoops) 1 tileSize envs'
-          workassistLoop workassistIndex tileCount $ \seqMode tileIdx' -> do
+          envs'' <- bindLocalsInTile (\_ -> not $ null $ ptOtherLoops tileLoops) 1 maxTileSize envs'
+          workassistLoop workassistIndex tileCountWord64 $ \seqMode tileIdx' -> do
             tileIdx <- instr' $ BitCast scalarType tileIdx'
+
+            tileSize' <- tileSize (OP_Int tileIdx) size (OP_Int tileCount')
 
             tileIdxAbsolute <-
               -- For a scanr, convert low-to-high indices to high-to-low indices:
@@ -183,8 +229,8 @@ codegen name env cluster args
                 return j
               else
                 return tileIdx
-            lower <- A.mul numType (OP_Int tileIdxAbsolute) (A.liftInt tileSize)
-            upper' <- A.add numType lower (A.liftInt tileSize)
+            lower <- A.mul numType (OP_Int tileIdxAbsolute) tileSize'
+            upper' <- A.add numType lower tileSize'
             upper <- A.min singleType upper' size
 
             -- If there is only a single tile loop (i.e. no parallel scans),
@@ -322,6 +368,13 @@ codegen name env cluster args
     isDescending :: LoopDirection Int -> Bool
     isDescending LoopDescending = True
     isDescending _ = False
+
+threadCount :: IO Word64
+threadCount = do
+  nproc <- getNumProcessors
+  menv  <- (readMaybe =<<) <$> lookupEnv "ACCELERATE_LLVM_NATIVE_THREADS"
+
+  return $ fromIntegral $ fromMaybe nproc menv
 
 linkage :: Maybe LP.Linkage
 linkage = Just LP.DLLExport
