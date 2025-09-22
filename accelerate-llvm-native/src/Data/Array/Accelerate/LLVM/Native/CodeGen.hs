@@ -111,7 +111,7 @@ codegen name env cluster args
         Nothing -> internalError "Could not generate code for a cluster. Does parCodeGen lack a case for a collective parallel operation?"
         Just (Exists parCodes) -> do
           let hasScan = parCodeGenHasMultipleTileLoops parCodes
-          let maxTileSize = if hasScan then 1024 * 2 else 1024 * 1024
+          let maxTileSize = 1024 * 1024
           let threads = fromIntegral $ unsafePerformIO threadCount :: Int
           let tileSize :: Operands Int -> Operands Int -> Operands Int -> CodeGen Native (Operands Int)
               tileSize tileIdx iterCount tileCount =
@@ -130,7 +130,7 @@ codegen name env cluster args
                   f' <- A.min singleType f (A.liftInt maxTileSize)
                   let l = A.liftInt 1
                   numerator <- A.sub numType f' l
-                  denom <- A.sub numType (A.liftInt 1) tileCount
+                  denom <- A.sub numType tileCount (A.liftInt 1)
                   decrStep <- A.quot TypeInt numerator denom
                   decr <- A.mul numType decrStep tileIdx
                   A.sub numType f' decr
