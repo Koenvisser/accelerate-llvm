@@ -65,7 +65,7 @@ import Data.Array.Accelerate.LLVM.CodeGen.Sugar (app1, IROpenFun2 (app2))
 import Data.Array.Accelerate.LLVM.CodeGen.Exp
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Arithmetic as A
 import Data.Array.Accelerate.LLVM.Native.CodeGen.Permute (atomically)
-import Data.Array.Accelerate.AST.LeftHandSide (Exists (Exists))
+import Data.Array.Accelerate.AST.LeftHandSide (Exists (Exists), flattenTupR)
 import Control.Monad
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Loop as Loop
 import Data.Array.Accelerate.LLVM.Native.CodeGen.Loop
@@ -76,6 +76,7 @@ import GHC.IO (unsafePerformIO)
 import GHC.Conc (getNumProcessors)
 import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
+import LLVM.AST.Type.Operand (Operand)
 
 codegen :: String
         -> Env AccessGroundR env
@@ -99,6 +100,8 @@ codegen name env cluster args
     workBlock <- newBlock "work"
     _ <- switch (OP_Word64 workassistFirstIndex) workBlock [(0xFFFFFFFF, initBlock), (0xFFFFFFFE, finishBlock)]
     let hasPermute = hasNPermute flat
+    let threads = fromIntegral $ unsafePerformIO threadCount :: Int
+    let maxTileSize = 1024 * 1024
 
     if parallelDepth == 0 && rank shr /= 0 then do
       let (envs, loops) = initEnv gamma shr idxLHS sizes dirs localR localLHS
@@ -111,52 +114,64 @@ codegen name env cluster args
         Nothing -> internalError "Could not generate code for a cluster. Does parCodeGen lack a case for a collective parallel operation?"
         Just (Exists parCodes) -> do
           let hasScan = parCodeGenHasMultipleTileLoops parCodes
-          let maxTileSize = 1024 * 1024
-          let threads = fromIntegral $ unsafePerformIO threadCount :: Int
-          let tileSize :: Operands Int -> Operands Int -> Operands Int -> CodeGen Native (Operands Int)
-              tileSize tileIdx iterCount tileCount =
-                if rank shr > 1 then
-                  return $ A.liftInt 32
-                else if hasScan then
-                  -- We need to choose a tile size such that the values in the
-                  -- first tile loop (the reduce step of the chained scan) are
-                  -- still in the cache during the second tile loop (the scan
-                  -- step of the chained scan).
-                  return $ A.liftInt $ 1024 * 2
-                else do
-                  -- decr = (f - l) / (N - 1)
-                  -- tileSize = f - decr * tileIdx
-                  f <- A.quot TypeInt iterCount (A.liftInt $ 2 * threads)
-                  f' <- A.min singleType f (A.liftInt maxTileSize)
-                  let l = A.liftInt 1
-                  numerator <- A.sub numType f' l
-                  denom <- A.sub numType tileCount (A.liftInt 1)
-                  decrStep <- A.quot TypeInt numerator denom
-                  decr <- A.mul numType decrStep tileIdx
-                  A.sub numType f' decr
+          -- f = I / 2 * threads, l = 1
+          f <- do 
+            f' <- A.quot TypeInt size (A.liftInt $ 2 * threads)
+            A.min singleType f' (A.liftInt maxTileSize)
+          let l = A.liftInt 1
                   
-                  
-
-          let tileCount :: Operands Int -> CodeGen Native (Operands Int)
-              tileCount iterCount = 
+          tileCount <- 
                 if rank shr > 1 then do
                   let tileSize' = A.liftInt 32
-                  sizeAdd <- A.add numType iterCount (A.liftInt $ 32 - 1)
+                  sizeAdd <- A.add numType size (A.liftInt $ 32 - 1)
                   A.quot TypeInt sizeAdd tileSize'
                 else if hasScan then do
                   let tileSize' = A.liftInt $ 1024 * 2
-                  sizeAdd <- A.add numType iterCount (A.liftInt $ (1024 * 2) - 1)
+                  sizeAdd <- A.add numType size (A.liftInt $ (1024 * 2) - 1)
                   A.quot TypeInt sizeAdd tileSize'
                 else do
                   -- N = 2 * I / (f + l)
-                  -- f = I / 2 * threads, l = 1
-                  f <- A.quot TypeInt iterCount (A.liftInt $ 2 * threads)
-                  f' <- A.min singleType f (A.liftInt maxTileSize)
-                  let l = A.liftInt 1
-                  numerator <- A.mul numType (A.liftInt 2) iterCount
-                  denom <- A.add numType f' l
+                  numerator <- A.mul numType (A.liftInt 2) size
+                  denom <- A.add numType f l
                   A.quot TypeInt numerator denom
-                 
+
+          -- decr = (f - l) / (N - 1)
+          decrStep <- do
+            numerator <- A.sub numType f l
+            denom <- A.sub numType tileCount (A.liftInt 1)
+            A.quot TypeInt numerator denom
+
+          let tileIndices :: Operands Int -> CodeGen Native (Operands Int, Operands Int)
+              tileIndices tileIdx = do
+                if rank shr > 1 then do
+                  -- startOfTile = tileIdx * tileSize
+                  start <- A.mul numType tileIdx (A.liftInt 32)
+                  end <- A.add numType start (A.liftInt 32)
+                  return (start, end)
+                else if hasScan then do
+                  -- startOfTile = tileIdx * tileSize
+                  start <- A.mul numType tileIdx (A.liftInt $ 1024 * 2)
+                  end <- A.add numType start (A.liftInt $ 1024 * 2)
+                  return (start, end)
+                else do
+                  -- = tileIdx * firstSize - dec * (tileIdx * (tileIdx - 1)) / 2
+                  -- or more simply: sum_{i=0}^{tileIdx-1} (firstSize - i * dec)
+                  -- a = tileIdx * firstSize
+                  a <- A.mul numType tileIdx f
+                  -- b = tileIdx * (tileIdx - 1)
+                  t1 <- A.sub numType tileIdx (A.liftInt 1)
+                  b  <- A.mul numType tileIdx t1
+                  -- half = b / 2
+                  half <- A.quot TypeInt b (A.liftInt 2)
+                  -- decPart = dec * half
+                  decPart <- A.mul numType decrStep half
+                  -- result = a - decPart
+                  start <- A.sub numType a decPart
+                  decr <- A.mul numType decrStep tileIdx
+                  tileSize <- A.sub numType f decr
+                  end <- A.add numType start tileSize
+                  return (start, end)
+                              
           let envs' = envs{
             envsLoopDepth = 0,
             envsDescending = isDescending direction
@@ -170,10 +185,7 @@ codegen name env cluster args
           setBlock initBlock
           do
             -- Number of tiles
-            -- sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
-            -- OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
-
-            OP_Int tileCount' <- tileCount size
+            let OP_Int tileCount' = tileCount
 
             -- Initialize kernel memory
             parCodeGenInitMemory kernelMem envs' TupleIdxSelf parCodes
@@ -196,13 +208,8 @@ codegen name env cluster args
 
           setBlock workBlock
           -- Number of tiles
-          -- sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
-          -- OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
-          -- tileCount <- instr' $ BitCast scalarType tileCount'
-
-          OP_Int tileCount' <- tileCount size
+          let OP_Int tileCount' = tileCount
           tileCountWord64 <- instr' $ BitCast scalarType tileCount'
-
 
           -- Emit code to initialize a thread, and get the codes for the tile loops
           tileLoops <- genParallel kernelMem envs' TupleIdxSelf parCodes
@@ -217,8 +224,6 @@ codegen name env cluster args
           workassistLoop workassistIndex tileCountWord64 $ \seqMode tileIdx' -> do
             tileIdx <- instr' $ BitCast scalarType tileIdx'
 
-            tileSize' <- tileSize (OP_Int tileIdx) size (OP_Int tileCount')
-
             tileIdxAbsolute <-
               -- For a scanr, convert low-to-high indices to high-to-low indices:
               -- The first block (with tileIdx 0) should now correspond with the last
@@ -229,8 +234,7 @@ codegen name env cluster args
                 return j
               else
                 return tileIdx
-            lower <- A.mul numType (OP_Int tileIdxAbsolute) tileSize'
-            upper' <- A.add numType lower tileSize'
+            (lower, upper') <- tileIndices (OP_Int tileIdxAbsolute)
             upper <- A.min singleType upper' size
 
             -- If there is only a single tile loop (i.e. no parallel scans),
@@ -327,12 +331,14 @@ codegen name env cluster args
       -- The work per iteration is probably very small.
       -- If we do not parallelize over all dimensions, choose a tile size of 1.
       -- The work per iteration is probably large enough.
-      let tileSize = if parallelDepth == rank shr then chunkSize parallelShr else chunkSizeOne parallelShr
+      -- let tileSize = if parallelDepth == rank shr then chunkSize parallelShr else chunkSizeOne parallelShr
       let parSizes = parallelIterSize parallelShr loops
+      -- let test = flattenTupR parSizes
 
       setBlock initBlock
       do
-        tileCount <- chunkCount parallelShr parSizes (A.lift (shapeType parallelShr) tileSize)
+        fs <- chunkTileStartSize parallelShr parSizes threads maxTileSize
+        tileCount <- chunkCount parallelShr parSizes fs
         tileCount' <- shapeSize parallelShr tileCount
         -- We are not using kernel memory, so no need to initialize it.
 
@@ -349,8 +355,19 @@ codegen name env cluster args
             if parallelDepth /= rank shr then []
             else {- if hasPermute then -} [Loop.LoopInterleave]
             -- else [Loop.LoopVectorize]
-      workassistChunked ann parallelShr workassistIndex tileSize parSizes $ \idx -> do
-        let envs' = envs{
+      fs <- chunkTileStartSize parallelShr parSizes threads maxTileSize
+      tileCount <- chunkCount parallelShr parSizes fs
+      tileCount' <- shapeSize parallelShr tileCount
+      tileCount'' :: Operand Word64 <- instr' $ BitCast scalarType $ op TypeInt tileCount'
+
+      decrSteps <- chunkTileDecrStep parallelShr parSizes fs
+
+      workassistLoop workassistIndex tileCount'' $ \_ chunkLinearIndex -> do
+        chunkLinearIndex' <- instr' $ BitCast scalarType chunkLinearIndex
+        chunkIndex <- indexOfInt parallelShr tileCount (OP_Int chunkLinearIndex')
+        (start, end) <- chunkBounds parallelShr parSizes chunkIndex fs decrSteps
+        imapNestFromTo [] ann parallelShr start end parSizes (\idx _ -> do 
+          let envs' = envs{
             envsLoopDepth = parallelDepth,
             envsIdx =
               foldr (\(o, i) -> Env.partialUpdate o i) (envsIdx envs)
@@ -359,7 +376,8 @@ codegen name env cluster args
             envsIsFirst = OP_Bool $ boolean False,
             envsDescending = False
           }
-        genSequential envs' (drop parallelDepth loops) $ opCodeGens opCodeGen flatOps
+          genSequential envs' (drop parallelDepth loops) $ opCodeGens opCodeGen flatOps
+          )
 
       pure 0
   where
