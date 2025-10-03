@@ -130,16 +130,12 @@ codegen name env cluster args
                   sizeAdd <- A.add numType size (A.liftInt $ (1024 * 2) - 1)
                   A.quot TypeInt sizeAdd tileSize'
                 else do
-                  -- N = 2 * I / (f + l)
+                  -- N = ceil(2 * I / (f + l))
                   numerator <- A.mul numType (A.liftInt 2) size
                   denom <- A.add numType f l
-                  A.quot TypeInt numerator denom
-
-          -- decr = (f - l) / (N - 1)
-          decrStep <- do
-            numerator <- A.sub numType f l
-            denom <- A.sub numType tileCount (A.liftInt 1)
-            A.quot TypeInt numerator denom
+                  denomMin1 <- A.sub numType denom (A.liftInt 1)
+                  numeratorAdd <- A.add numType numerator denomMin1
+                  A.quot TypeInt numeratorAdd denom
 
           let tileIndices :: Operands Int -> CodeGen Native (Operands Int, Operands Int)
               tileIndices tileIdx = do
@@ -154,24 +150,29 @@ codegen name env cluster args
                   end <- A.add numType start (A.liftInt $ 1024 * 2)
                   return (start, end)
                 else do
-                  -- = tileIdx * firstSize - dec * (tileIdx * (tileIdx - 1)) / 2
-                  -- or more simply: sum_{i=0}^{tileIdx-1} (firstSize - i * dec)
-                  -- a = tileIdx * firstSize
-                  a <- A.mul numType tileIdx f
-                  -- b = tileIdx * (tileIdx - 1)
-                  t1 <- A.sub numType tileIdx (A.liftInt 1)
-                  b  <- A.mul numType tileIdx t1
-                  -- half = b / 2
-                  half <- A.quot TypeInt b (A.liftInt 2)
-                  -- decPart = dec * half
-                  decPart <- A.mul numType decrStep half
-                  -- result = a - decPart
-                  start <- A.sub numType a decPart
-                  decr <- A.mul numType decrStep tileIdx
-                  tileSize <- A.sub numType f decr
-                  end <- A.add numType start tileSize
+                  -- start = fi - ((i - 1) * i * (f - l) * (f + l)) / (2 * (2N - f - l))
+                  -- end   = f(i + 1) - (i* (i + 1) * (f - l) * (f + l)) / (2 * (2N - f - l)) + 1
+                  let i = tileIdx
+                  iMinus1 <- A.sub numType i (A.liftInt 1)
+                  iPlus1 <- A.add numType i (A.liftInt 1)
+                  fi <- A.mul numType f i
+                  fi1 <- A.mul numType f iPlus1
+                  fPlusL <- A.add numType f l
+                  fMinusL <- A.sub numType f l
+                  twoN <- A.mul numType (A.liftInt 2) size
+                  denom <- A.sub numType twoN fPlusL
+                  denom2 <- A.mul numType (A.liftInt 2) denom
+                  numerator <- A.mul numType fPlusL fMinusL
+                  numerStart <- A.mul numType iMinus1 i
+                  numerStart' <- A.mul numType numerStart numerator
+                  startSub <- A.quot TypeInt numerStart' denom2
+                  start <- A.sub numType fi startSub
+                  numerEnd <- A.mul numType i iPlus1
+                  numerEnd' <- A.mul numType numerEnd numerator
+                  endSub <- A.quot TypeInt numerEnd' denom2
+                  end <- A.sub numType fi1 endSub
                   return (start, end)
-                              
+          
           let envs' = envs{
             envsLoopDepth = 0,
             envsDescending = isDescending direction
