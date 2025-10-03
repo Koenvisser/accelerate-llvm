@@ -237,27 +237,18 @@ chunkTileStartSize (ShapeRsnoc shr) (OP_Pair sh sz) threads maxTileSize = do
 
   return $ OP_Pair starts f
 
-chunkTileDecrStep :: ShapeR sh -> Operands sh -> Operands sh -> CodeGen Native (Operands sh)
-chunkTileDecrStep ShapeRz OP_Unit OP_Unit = return OP_Unit
-chunkTileDecrStep (ShapeRsnoc shr) (OP_Pair fs f) (OP_Pair chunkSh chunkSz) = do
-  steps <- chunkTileDecrStep shr fs chunkSh
-  -- decr = (f - l) / (N - 1)
-  let l = A.liftInt 1
-  numerator <- A.sub numType f l
-  denom <- A.sub numType chunkSz (A.liftInt 1)
-  step <- A.quot TypeInt numerator denom
-  return $ OP_Pair steps step
-
 chunkCount :: ShapeR sh -> Operands sh -> Operands sh -> CodeGen Native (Operands sh)
 chunkCount ShapeRz OP_Unit OP_Unit = return OP_Unit
 chunkCount (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair fs f) = do
   counts <- chunkCount shr sh fs
-  -- N = 2 * I / (f + l)
+  -- N = ceil(2 * I / (f + l))
   -- f = I / 2 * threads, l = 1
   let l = A.liftInt 1
   numerator <- A.mul numType (A.liftInt 2) sz
   denom <- A.add numType f l
-  count <- A.quot TypeInt numerator denom
+  denomMin1 <- A.sub numType denom (A.liftInt 1)
+  numeratorAdd <- A.add numType numerator denomMin1
+  count <- A.quot TypeInt numeratorAdd denom
 
   return $ OP_Pair counts count
 
@@ -266,30 +257,33 @@ chunkBounds
   -> Operands sh -- Dimension size
   -> Operands sh -- Chunk index
   -> Operands sh -- First chunk size
-  -> Operands sh -- Decrement step
   -> CodeGen Native (Operands sh, Operands sh)
-chunkBounds ShapeRz OP_Unit OP_Unit OP_Unit OP_Unit = return (OP_Unit, OP_Unit)
-chunkBounds (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair idxSh idx) (OP_Pair fs f) (OP_Pair decrSh decrStep) = do
-  (startIxs, endIxs) <- chunkBounds shr sh idxSh fs decrSh
-  -- = tileIdx * firstSize - dec * (tileIdx * (tileIdx - 1)) / 2
-  -- or more simply: sum_{i=0}^{tileIdx-1} (firstSize - i * dec)
-  -- a = tileIdx * firstSize
-  a <- A.mul numType idx f
-  -- b = tileIdx * (tileIdx - 1)
-  t1 <- A.sub numType idx (A.liftInt 1)
-  b  <- A.mul numType idx t1
-  -- half = b / 2
-  half <- A.quot TypeInt b (A.liftInt 2)
-  -- decPart = dec * half
-  decPart <- A.mul numType decrStep half
-  -- result = a - decPart
-  start <- A.sub numType a decPart
-  decr <- A.mul numType decrStep idx
-  tileSize <- A.sub numType f decr
-  end <- A.add numType start tileSize
-  end' <- A.min singleType end sz
+chunkBounds ShapeRz OP_Unit OP_Unit OP_Unit = return (OP_Unit, OP_Unit)
+chunkBounds (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair idxSh idx) (OP_Pair fs f) = do
+  (startIxs, endIxs) <- chunkBounds shr sh idxSh fs
+  -- start = fi - ((i - 1) * i * (f - l) * (f + l)) / (2 * (2I - f - l))
+  -- end   = f(i + 1) - (i* (i + 1) * (f - l) * (f + l)) / (2 * (2I - f - l))
+  let i = idx
+  iMinus1 <- A.sub numType i (A.liftInt 1)
+  iPlus1 <- A.add numType i (A.liftInt 1)
+  fi <- A.mul numType f i
+  fi1 <- A.mul numType f iPlus1
+  fPlusL <- A.add numType f (A.liftInt 1)
+  fMinusL <- A.sub numType f (A.liftInt 1)
+  twoN <- A.mul numType (A.liftInt 2) sz
+  denom <- A.sub numType twoN fPlusL
+  denom2 <- A.mul numType (A.liftInt 2) denom
+  numerator <- A.mul numType fPlusL fMinusL
+  numerStart <- A.mul numType iMinus1 i
+  numerStart' <- A.mul numType numerStart numerator
+  startSub <- A.quot TypeInt numerStart' denom2
+  start <- A.sub numType fi startSub
+  numerEnd <- A.mul numType i iPlus1
+  numerEnd' <- A.mul numType numerEnd numerator
+  endSub <- A.quot TypeInt numerEnd' denom2
+  end <- A.sub numType fi1 endSub
 
-  return (OP_Pair startIxs start, OP_Pair endIxs end')
+  return (OP_Pair startIxs start, OP_Pair endIxs end)
 
 atomicAdd :: MemoryOrdering -> Operand (Ptr Word64) -> Operand Word64 -> CodeGen Native (Operand Word64)
 atomicAdd ordering ptr increment = do

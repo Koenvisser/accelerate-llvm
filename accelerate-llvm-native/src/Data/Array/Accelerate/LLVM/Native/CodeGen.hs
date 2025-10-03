@@ -150,8 +150,8 @@ codegen name env cluster args
                   end <- A.add numType start (A.liftInt $ 1024 * 2)
                   return (start, end)
                 else do
-                  -- start = fi - ((i - 1) * i * (f - l) * (f + l)) / (2 * (2N - f - l))
-                  -- end   = f(i + 1) - (i* (i + 1) * (f - l) * (f + l)) / (2 * (2N - f - l)) + 1
+                  -- start = fi - ((i - 1) * i * (f - l) * (f + l)) / (2 * (2I - f - l))
+                  -- end   = f(i + 1) - (i* (i + 1) * (f - l) * (f + l)) / (2 * (2I - f - l))
                   let i = tileIdx
                   iMinus1 <- A.sub numType i (A.liftInt 1)
                   iPlus1 <- A.add numType i (A.liftInt 1)
@@ -361,12 +361,10 @@ codegen name env cluster args
       tileCount' <- shapeSize parallelShr tileCount
       tileCount'' :: Operand Word64 <- instr' $ BitCast scalarType $ op TypeInt tileCount'
 
-      decrSteps <- chunkTileDecrStep parallelShr parSizes fs
-
       workassistLoop workassistIndex tileCount'' $ \_ chunkLinearIndex -> do
         chunkLinearIndex' <- instr' $ BitCast scalarType chunkLinearIndex
         chunkIndex <- indexOfInt parallelShr tileCount (OP_Int chunkLinearIndex')
-        (start, end) <- chunkBounds parallelShr parSizes chunkIndex fs decrSteps
+        (start, end) <- chunkBounds parallelShr parSizes chunkIndex fs
         imapNestFromTo [] ann parallelShr start end parSizes (\idx _ -> do 
           let envs' = envs{
             envsLoopDepth = parallelDepth,
