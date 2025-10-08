@@ -27,10 +27,10 @@ import Data.Array.Accelerate.LLVM.CodeGen.Constant
 import Data.Array.Accelerate.LLVM.CodeGen.Exp
 import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.CodeGen.Monad
+import Data.Array.Accelerate.LLVM.CodeGen.Profile
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Loop            as Loop
 
 import Data.Array.Accelerate.LLVM.Native.Target                     ( Native )
-
 import LLVM.AST.Type.Representation
 import LLVM.AST.Type.Operand
 import LLVM.AST.Type.Instruction
@@ -43,6 +43,9 @@ import Control.Monad.State
 import Data.Array.Accelerate.LLVM.CodeGen.Base
 import LLVM.AST.Type.Function
 import LLVM.AST.Type.Name
+import LLVM.AST.Type.Downcast (downcast)
+import LLVM.AST.Type.GetElementPtr
+import LLVM.AST.Type.Constant
 
 -- | A standard 'for' loop, that steps from the start to end index executing the
 -- given function at each index.
@@ -232,7 +235,7 @@ chunkTileStartSize ShapeRz OP_Unit _ _ = return OP_Unit
 chunkTileStartSize (ShapeRsnoc shr) (OP_Pair sh sz) threads maxTileSize = do
   starts <- chunkTileStartSize shr sh threads maxTileSize
   -- f = I / 2 * threads, l = 1
-  f' <- A.quot TypeInt sz (A.liftInt $ 2 * threads)
+  f' <- A.quot integralType sz (A.liftInt $ 2 * threads)
   f <- A.min singleType f' (A.liftInt maxTileSize)
 
   return $ OP_Pair starts f
@@ -248,7 +251,7 @@ chunkCount (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair fs f) = do
   denom <- A.add numType f l
   denomMin1 <- A.sub numType denom (A.liftInt 1)
   numeratorAdd <- A.add numType numerator denomMin1
-  count <- A.quot TypeInt numeratorAdd denom
+  count <- A.quot integralType numeratorAdd denom
 
   return $ OP_Pair counts count
 
@@ -264,6 +267,7 @@ chunkBounds (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair idxSh idx) (OP_Pair fs f) 
   -- start = fi - ((i - 1) * i * (f - l) * (f + l)) / (2 * (2I - f - l))
   -- end   = f(i + 1) - (i* (i + 1) * (f - l) * (f + l)) / (2 * (2I - f - l))
   let i = idx
+  _ <- putInt i
   iMinus1 <- A.sub numType i (A.liftInt 1)
   iPlus1 <- A.add numType i (A.liftInt 1)
   fi <- A.mul numType f i
@@ -276,11 +280,11 @@ chunkBounds (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair idxSh idx) (OP_Pair fs f) 
   numerator <- A.mul numType fPlusL fMinusL
   numerStart <- A.mul numType iMinus1 i
   numerStart' <- A.mul numType numerStart numerator
-  startSub <- A.quot TypeInt numerStart' denom2
+  startSub <- A.quot integralType numerStart' denom2
   start <- A.sub numType fi startSub
   numerEnd <- A.mul numType i iPlus1
   numerEnd' <- A.mul numType numerEnd numerator
-  endSub <- A.quot TypeInt numerEnd' denom2
+  endSub <- A.quot integralType numerEnd' denom2
   end <- A.sub numType fi1 endSub
 
   return (OP_Pair startIxs start, OP_Pair endIxs end)
@@ -294,6 +298,16 @@ atomicRead :: MemoryOrdering -> Operand (Ptr Word64) -> CodeGen Native (Operand 
 atomicRead ordering ptr = atomicAdd ordering ptr (integral TypeWord64 0)
 
 ---- debugging tools ----
+putInt :: Operands Int -> CodeGen Native (Operands Int)
+putInt x = do
+  (nm, l) <- global_string "%d\n"
+  let ptr = ConstantOperand $ derefGlobalString l nm
+  call (lamUnnamed primType $ lamUnnamed primType $ Body (PrimType primType) Nothing (Label "printf"))
+       (ArgumentsCons ptr []
+         $ ArgumentsCons (op TypeInt x) []
+           ArgumentsNil)
+       []
+
 putchar :: Operands Int -> CodeGen Native (Operands Int)
 putchar x = call (lamUnnamed primType $ Body (PrimType primType) Nothing (Label "putchar")) 
                  (ArgumentsCons (op TypeInt x) [] ArgumentsNil) 
