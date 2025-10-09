@@ -153,7 +153,9 @@ codegen name env cluster args
                   -- start = fi - ((i - 1) * i * (f - l) * (f + l)) / (2 * (2I - f - l))
                   -- end   = f(i + 1) - (i* (i + 1) * (f - l) * (f + l)) / (2 * (2I - f - l))
                   let i = tileIdx
+                  _ <- putString "chunkBounds i="
                   _ <- putInt i
+                  _ <- putString "\n"
                   iMinus1 <- A.sub numType i (A.liftInt 1)
                   iPlus1 <- A.add numType i (A.liftInt 1)
                   fi <- A.mul numType f i

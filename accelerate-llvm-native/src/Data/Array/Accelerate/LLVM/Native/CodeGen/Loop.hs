@@ -267,7 +267,9 @@ chunkBounds (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair idxSh idx) (OP_Pair fs f) 
   -- start = fi - ((i - 1) * i * (f - l) * (f + l)) / (2 * (2I - f - l))
   -- end   = f(i + 1) - (i* (i + 1) * (f - l) * (f + l)) / (2 * (2I - f - l))
   let i = idx
+  _ <- putString "chunkBounds i="
   _ <- putInt i
+  _ <- putString "\n"
   iMinus1 <- A.sub numType i (A.liftInt 1)
   iPlus1 <- A.add numType i (A.liftInt 1)
   fi <- A.mul numType f i
@@ -298,15 +300,18 @@ atomicRead :: MemoryOrdering -> Operand (Ptr Word64) -> CodeGen Native (Operand 
 atomicRead ordering ptr = atomicAdd ordering ptr (integral TypeWord64 0)
 
 ---- debugging tools ----
-putInt :: Operands Int -> CodeGen Native (Operands Int)
-putInt x = do
-  (nm, l) <- global_string "%d\n"
+putValue :: IsPrim a => Operand a -> String -> CodeGen Native (Operands Int)
+putValue val format = do
+  (nm, l) <- global_string format
   let ptr = ConstantOperand $ derefGlobalString l nm
   call (lamUnnamed primType $ lamUnnamed primType $ Body (PrimType primType) Nothing (Label "printf"))
        (ArgumentsCons ptr []
-         $ ArgumentsCons (op TypeInt x) []
+         $ ArgumentsCons val []
            ArgumentsNil)
        []
+
+putInt :: Operands Int -> CodeGen Native (Operands Int)
+putInt x = putValue (op TypeInt x) "%d"
 
 putchar :: Operands Int -> CodeGen Native (Operands Int)
 putchar x = call (lamUnnamed primType $ Body (PrimType primType) Nothing (Label "putchar")) 
@@ -321,3 +326,6 @@ putcharE = void $ putchar $ liftInt 69
 putcharF = void $ putchar $ liftInt 70
 putcharG = void $ putchar $ liftInt 71
 putcharH = void $ putchar $ liftInt 72
+
+putString :: String -> CodeGen Native ()
+putString str = foldl (>>) (return ()) (map (void . putchar . liftInt . fromEnum) str)
