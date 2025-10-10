@@ -260,45 +260,43 @@ chunkBounds
   -> Operands sh -- Dimension size
   -> Operands sh -- Chunk index
   -> Operands sh -- First chunk size
+  -> Operands sh -- Tile count
   -> CodeGen Native (Operands sh, Operands sh)
-chunkBounds ShapeRz OP_Unit OP_Unit OP_Unit = return (OP_Unit, OP_Unit)
-chunkBounds (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair idxSh idx) (OP_Pair fs f) = do
-  (startIxs, endIxs) <- chunkBounds shr sh idxSh fs
-  -- start = fi - ((i - 1) * i * (f - l) * (f + l)) / (2 * (2I - f - l))
-  -- end   = f(i + 1) - (i* (i + 1) * (f - l) * (f + l)) / (2 * (2I - f - l))
+chunkBounds ShapeRz OP_Unit OP_Unit OP_Unit OP_Unit = return (OP_Unit, OP_Unit)
+chunkBounds (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair idxSh idx) (OP_Pair fs f) (OP_Pair ts t) = do
+  (startIxs, endIxs) <- chunkBounds shr sh idxSh fs ts
+  -- start = fi - ((i - 1) * i * (f - l)) / (2 * (N - 1))
+  -- end   = f(i + 1) - ((i + 1) * i * (f - l)) / (2 * (N - 1))
   let i = idx
   iMinus1 <- A.sub numType i (A.liftInt 1)
   iPlus1 <- A.add numType i (A.liftInt 1)
   fi <- A.mul numType f i
   fi1 <- A.mul numType f iPlus1
-  fPlusL <- A.add numType f (A.liftInt 1)
-  fMinusL <- A.sub numType f (A.liftInt 1)
-  twoN <- A.mul numType (A.liftInt 2) sz
-  denom <- A.sub numType twoN fPlusL
-  denom2 <- A.mul numType (A.liftInt 2) denom
-  numerator <- A.mul numType fPlusL fMinusL
-  numerStart <- A.mul numType iMinus1 i
-  numerStart' <- A.mul numType numerStart numerator
-  startSub <- A.quot integralType numerStart' denom2
+  fMinusL <- A.sub numType f (A.liftInt 32)
+  nMinus1 <- A.sub numType t (A.liftInt 1)
+  denom <- A.mul numType (A.liftInt 2) nMinus1
+  numerator <- A.mul numType fMinusL i
+  numerStart <- A.mul numType iMinus1 numerator
+  startSub <- A.quot integralType numerStart denom
   start <- A.sub numType fi startSub
-  numerEnd <- A.mul numType i iPlus1
-  numerEnd' <- A.mul numType numerEnd numerator
-  endSub <- A.quot integralType numerEnd' denom2
+  numerEnd <- A.mul numType numerator iPlus1
+  endSub <- A.quot integralType numerEnd denom
   end <- A.sub numType fi1 endSub
 
-  _ <- instr' $ Fence (CrossThread, Acquire)
-  _ <- putString "chunkBounds i="
-  _ <- putInt i
-  _ <- putString "\n"
-  _ <- putString "  start="
-  _ <- putInt start
-  _ <- putString "\n"
-  _ <- putString "  end  ="
-  _ <- putInt end
-  _ <- putString "\n"
-  _ <- instr' $ Fence (CrossThread, Release)
+  start' <- A.min singleType start sz
+  end' <- A.min singleType end sz
 
-  return (OP_Pair startIxs start, OP_Pair endIxs end)
+  -- _ <- putString "chunkBounds i="
+  -- _ <- putInt i
+  -- _ <- putString "\n"
+  -- _ <- putString "start="
+  -- _ <- putInt start'
+  -- _ <- putString "\n"
+  -- _ <- putString "end="
+  -- _ <- putInt end'
+  -- _ <- putString "\n"
+
+  return (OP_Pair startIxs start', OP_Pair endIxs end')
 
 atomicAdd :: MemoryOrdering -> Operand (Ptr Word64) -> Operand Word64 -> CodeGen Native (Operand Word64)
 atomicAdd ordering ptr increment = do

@@ -118,7 +118,7 @@ codegen name env cluster args
           f <- do 
             f' <- A.quot TypeInt size (A.liftInt $ 2 * threads)
             A.min singleType f' (A.liftInt maxTileSize)
-          let l = A.liftInt 1
+          let l = A.liftInt 32
                   
           tileCount <- 
                 if rank shr > 1 then do
@@ -157,34 +157,31 @@ codegen name env cluster args
                   iPlus1 <- A.add numType i (A.liftInt 1)
                   fi <- A.mul numType f i
                   fi1 <- A.mul numType f iPlus1
-                  fPlusL <- A.add numType f l
                   fMinusL <- A.sub numType f l
-                  twoN <- A.mul numType (A.liftInt 2) size
-                  denom <- A.sub numType twoN fPlusL
-                  denom2 <- A.mul numType (A.liftInt 2) denom
-                  numerator <- A.mul numType fPlusL fMinusL
-                  numerStart <- A.mul numType iMinus1 i
-                  numerStart' <- A.mul numType numerStart numerator
-                  startSub <- A.quot TypeInt numerStart' denom2
+                  nMinus1 <- A.sub numType tileCount (A.liftInt 1)
+                  denom <- A.mul numType (A.liftInt 2) nMinus1
+                  numerator <- A.mul numType fMinusL i
+                  numerStart <- A.mul numType iMinus1 numerator
+                  startSub <- A.quot integralType numerStart denom
                   start <- A.sub numType fi startSub
-                  numerEnd <- A.mul numType i iPlus1
-                  numerEnd' <- A.mul numType numerEnd numerator
-                  endSub <- A.quot TypeInt numerEnd' denom2
+                  numerEnd <- A.mul numType numerator iPlus1
+                  endSub <- A.quot integralType numerEnd denom
                   end <- A.sub numType fi1 endSub
 
-                  _ <- instr' $ Fence (CrossThread, Acquire)
-                  _ <- putString "chunkBounds i="
-                  _ <- putInt i
-                  _ <- putString "\n"
-                  _ <- putString "  start="
-                  _ <- putInt start
-                  _ <- putString "\n"
-                  _ <- putString "  end="
-                  _ <- putInt end
-                  _ <- putString "\n"
-                  _ <- instr' $ Fence (CrossThread, Release)
+                  start' <- A.min singleType start size
+                  end' <- A.min singleType end size
 
-                  return (start, end)
+                  -- _ <- putString "chunkBounds i="
+                  -- _ <- putInt i
+                  -- _ <- putString "\n"
+                  -- _ <- putString "  start="
+                  -- _ <- putInt start'
+                  -- _ <- putString "\n"
+                  -- _ <- putString "  end="
+                  -- _ <- putInt end'
+                  -- _ <- putString "\n"
+
+                  return (start', end')
           
           let envs' = envs{
             envsLoopDepth = 0,
@@ -377,7 +374,7 @@ codegen name env cluster args
       workassistLoop workassistIndex tileCount'' $ \_ chunkLinearIndex -> do
         chunkLinearIndex' <- instr' $ BitCast scalarType chunkLinearIndex
         chunkIndex <- indexOfInt parallelShr tileCount (OP_Int chunkLinearIndex')
-        (start, end) <- chunkBounds parallelShr parSizes chunkIndex fs
+        (start, end) <- chunkBounds parallelShr parSizes chunkIndex fs tileCount
         imapNestFromTo [] ann parallelShr start end parSizes (\idx _ -> do 
           let envs' = envs{
             envsLoopDepth = parallelDepth,
