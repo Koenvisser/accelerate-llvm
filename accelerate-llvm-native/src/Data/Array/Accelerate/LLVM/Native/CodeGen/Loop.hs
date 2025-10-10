@@ -267,9 +267,6 @@ chunkBounds (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair idxSh idx) (OP_Pair fs f) 
   -- start = fi - ((i - 1) * i * (f - l) * (f + l)) / (2 * (2I - f - l))
   -- end   = f(i + 1) - (i* (i + 1) * (f - l) * (f + l)) / (2 * (2I - f - l))
   let i = idx
-  _ <- putString "chunkBounds i="
-  _ <- putInt i
-  _ <- putString "\n"
   iMinus1 <- A.sub numType i (A.liftInt 1)
   iPlus1 <- A.add numType i (A.liftInt 1)
   fi <- A.mul numType f i
@@ -288,6 +285,18 @@ chunkBounds (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair idxSh idx) (OP_Pair fs f) 
   numerEnd' <- A.mul numType numerEnd numerator
   endSub <- A.quot integralType numerEnd' denom2
   end <- A.sub numType fi1 endSub
+
+  _ <- instr' $ Fence (CrossThread, Acquire)
+  _ <- putString "chunkBounds i="
+  _ <- putInt i
+  _ <- putString "\n"
+  _ <- putString "  start="
+  _ <- putInt start
+  _ <- putString "\n"
+  _ <- putString "  end  ="
+  _ <- putInt end
+  _ <- putString "\n"
+  _ <- instr' $ Fence (CrossThread, Release)
 
   return (OP_Pair startIxs start, OP_Pair endIxs end)
 
