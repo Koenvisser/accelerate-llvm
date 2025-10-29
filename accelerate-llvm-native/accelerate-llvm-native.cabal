@@ -193,6 +193,9 @@ Library
   cc-options: -O2 -Wall -Wextra
   cxx-options: -O2 -Wall -Wextra -std=c++14
 
+  if os(linux)
+    pkgconfig-depends: numa
+
 test-suite nofib-llvm-native
   type:                 exitcode-stdio-1.0
   hs-source-dirs:       test/nofib

@@ -2,6 +2,7 @@
 // Define this to get access to thread affinities.
 // We only set thread affinities on Linux, since macOS does not support this.
 #define _GNU_SOURCE
+#include <numa.h>
 #endif
 
 #include "types.h"
@@ -21,6 +22,15 @@ struct RuntimeLib accelerate_runtime_lib = (struct RuntimeLib){
   .accelerate_signal_resolve = accelerate_signal_resolve,
   .hs_try_putmvar = hs_try_putmvar
 };
+
+#ifdef __linux__
+static int accelerate_get_numa_node(uint16_t cpu_id) {
+  if (numa_available() == -1) {
+    return -1; // NUMA not available
+  }
+  return numa_node_of_cpu(cpu_id);
+}
+#endif
 
 static void accelerate_parker_maybe_park(struct ThreadParker *parker) {
   pthread_mutex_lock(&parker->lock);
@@ -171,6 +181,71 @@ void* accelerate_worker(void *data_packed) {
     int16_t inc = (thread_idx % 2 == 0) ? 1 : -1;
     int16_t other_thread = thread_idx;
     bool workassisting_found = false;
+
+    #ifdef __linux__
+      int numa_node = accelerate_get_numa_node(thread_idx);
+      if (numa_node >= 0) {
+        while (true) {
+          other_thread += inc;
+          while (other_thread >= thread_count) other_thread -= thread_count;
+          if (other_thread < 0) other_thread += thread_count;
+          if (other_thread == thread_idx) break;
+
+          if (accelerate_get_numa_node(other_thread) != numa_node) continue;
+
+          _Atomic(uintptr_t) *ptr = &workers->scheduler.activities[other_thread];
+          if (atomic_load_explicit(ptr, memory_order_relaxed) == 0) continue;
+          uintptr_t activity = atomic_fetch_add_explicit(ptr, accelerate_pack(NULL, 1), memory_order_acquire);
+          struct KernelLaunch *kernel = accelerate_unpack_ptr(activity);
+          if (kernel == NULL) continue;
+          // We found a data-parallel activity where we can assist!
+          if (attempts_remaining == 0) {
+            accelerate_parker_cancel_park(&workers->scheduler.parker);
+          }
+          kernel->work_function(kernel, workers->locks, 0);
+          // signal_task_empty from the Work Assisting paper,
+          // and end_task
+          // Similar to above, signal_task_empty happens here instead of in the work function.
+          // The same reasoning as above applies here.
+          uintptr_t old = atomic_load_explicit(ptr, memory_order_relaxed);
+          bool is_last;
+          while (true) {
+            if (accelerate_unpack_ptr(old) != kernel) {
+              // Another thread has moved the reference count.
+              // We now only need to decrement the reference count for this thread.
+              int32_t remaining_threads = atomic_fetch_add_explicit(
+                &kernel->active_threads,
+                -1,
+                memory_order_acq_rel
+              );
+              is_last = remaining_threads == 1;
+              break;
+            }
+            if (atomic_compare_exchange_weak_explicit(ptr, &old, accelerate_pack(NULL, 0), memory_order_relaxed, memory_order_relaxed)) {
+              // Move the reference count from the pointer to the task object.
+              int32_t remaining_threads = atomic_fetch_add_explicit(&kernel->active_threads, accelerate_unpack_tag(old), memory_order_acq_rel);
+              is_last = -remaining_threads == accelerate_unpack_tag(old);
+              break;
+            }
+          }
+          if (is_last) {
+            // The last thread executes the finish function.
+            // First, execute the finish procedure of the kernel:
+            kernel->work_function(kernel, workers->locks, 0xFFFFFFFE);
+            // Then continue the program after this kernel, via
+            // program_continuation in the KernelLaunch structure.
+            task.program = kernel->program;
+            task.location = kernel->program_continuation;
+          }
+          attempts_remaining = ATTEMPTS;
+          workassisting_found = true;
+          break;
+        }
+        if (workassisting_found) continue;
+        other_thread = thread_idx;
+      }
+    #endif
+
     while (true) {
       other_thread += inc;
       while (other_thread >= thread_count) other_thread -= thread_count;
