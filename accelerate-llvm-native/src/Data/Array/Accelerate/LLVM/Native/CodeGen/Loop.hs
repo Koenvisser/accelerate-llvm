@@ -307,32 +307,22 @@ atomicRead :: MemoryOrdering -> Operand (Ptr Word64) -> CodeGen Native (Operand 
 atomicRead ordering ptr = atomicAdd ordering ptr (integral TypeWord64 0)
 
 ---- debugging tools ----
-putValue :: IsPrim a => Operand a -> String -> CodeGen Native (Operands Int)
-putValue val format = do
+printf :: IsPrim a => String -> Operand a -> CodeGen Native (Operands Int)
+printf format val = do
   (nm, l) <- global_string format
-  let ptr = ConstantOperand $ derefGlobalString l nm
+  let strPtr = ConstantOperand $ derefGlobalString l nm
   call (lamUnnamed primType $ lamUnnamed primType $ Body (PrimType primType) Nothing (Label "printf"))
-       (ArgumentsCons ptr []
+       (ArgumentsCons strPtr []
          $ ArgumentsCons val []
            ArgumentsNil)
        []
 
-putInt :: Operands Int -> CodeGen Native (Operands Int)
-putInt x = putValue (op TypeInt x) "%d"
+putInt :: Operands Int -> CodeGen Native ()
+putInt x = void $ printf "%d" (op TypeInt x)
 
 putchar :: Operands Int -> CodeGen Native (Operands Int)
 putchar x = call (lamUnnamed primType $ Body (PrimType primType) Nothing (Label "putchar")) 
                  (ArgumentsCons (op TypeInt x) [] ArgumentsNil) 
                  []
-putcharA, putcharB, putcharC, putcharD, putcharE, putcharF, putcharG, putcharH :: CodeGen Native ()
-putcharA = void $ putchar $ liftInt 65
-putcharB = void $ putchar $ liftInt 66
-putcharC = void $ putchar $ liftInt 67
-putcharD = void $ putchar $ liftInt 68
-putcharE = void $ putchar $ liftInt 69
-putcharF = void $ putchar $ liftInt 70
-putcharG = void $ putchar $ liftInt 71
-putcharH = void $ putchar $ liftInt 72
-
 putString :: String -> CodeGen Native ()
 putString str = foldl (>>) (return ()) (map (void . putchar . liftInt . fromEnum) str)
