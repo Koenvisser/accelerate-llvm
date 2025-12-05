@@ -28,6 +28,7 @@ import Data.Array.Accelerate.AST.LeftHandSide
 import Data.Array.Accelerate.Analysis.Match
 import Data.Array.Accelerate.Error
 import Data.Array.Accelerate.Representation.Array
+import Data.Array.Accelerate.Representation.Elt
 import Data.Array.Accelerate.Representation.Shape
 import Data.Array.Accelerate.Representation.Slice
 import Data.Array.Accelerate.Representation.Type
@@ -270,7 +271,21 @@ llvmOfOpenExp arrayInstr top env = cvtE top
     coerce :: ScalarType a -> ScalarType b -> Operands a -> IROpenExp arch env b
     coerce s t x
       | Just Refl <- matchScalarType s t = return $ x
-      | otherwise                        = ir t <$> instr' (BitCast t (op s x))
+      | otherwise                          = case (s, x) of 
+        (VectorScalarType (VectorType n (NumSingleType (IntegralNumType tv))), OP_Vec vec) -> case t of
+          (SingleScalarType (NumSingleType (IntegralNumType int))) | bytesElt (TupRsingle s) == bytesElt (TupRsingle t) -> do
+            start <- A.fromIntegral integralType (IntegralNumType int) (A.liftInt 0)
+            foldl (\acc' i -> do
+              acc <- acc'
+              elemA <- instr' $ ExtractElement i vec
+              elemB <- A.fromIntegral tv (IntegralNumType int) (ir tv elemA)
+              elemL <- A.shiftL int elemB (A.liftInt (8 * fromIntegral i * bytesElt (TupRsingle (SingleScalarType (NumSingleType (IntegralNumType tv))))))
+              A.bor int acc elemL
+              ) (return start) [0 .. fromIntegral n - 1]
+          (SingleScalarType _) -> internalError "bitcast: Vector to Scalar not equal size"
+          (VectorScalarType _) -> internalError "bitcast: Vector to Vector not implemented"
+        (VectorScalarType _, _) -> internalError "bitcast: Floating Vector not implemented"
+        (SingleScalarType _, _) -> instr (BitCast t (op s x))
 
     primFun :: PrimFun (a -> r)
             -> PreOpenExp arr env a
