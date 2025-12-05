@@ -238,7 +238,7 @@ codegen name env cluster args
                             -- Only do loop peeling if requested and when there are no nested loops.
                             -- Peeling over nested loops causes a lot of code duplication,
                             -- and is probably not worth it.
-                            [ Loop.LoopPeel | ptPeel tileLoop && null loops' ]
+                            [ Loop.LoopPeel | cpuLoopPeel (ptAnalysis tileLoop) && null loops' ]
                             -- We can use LoopNonEmpty since we
                             -- know that each tile is non-empty.
                             -- We cannot vectorize this loop (yet), as LLVM cannot vectorize loops
@@ -269,7 +269,7 @@ codegen name env cluster args
                               -- Only do loop peeling if requested and when there are no nested loops.
                               -- Peeling over nested loops causes a lot of code duplication,
                               -- and is probably not worth it.
-                              [ Loop.LoopPeel | ptPeel tileLoop && null loops'' ]
+                              [ Loop.LoopPeel | cpuLoopPeel (ptAnalysis tileLoop) && null loops'' ]
                               -- LLVM cannot vectorize loops containing scans (yet).
                               -- The first tile loop only does a reduction, others will perform a scan.
                               -- Loops containing permute (not permuteUnique) can
@@ -431,9 +431,11 @@ opCodeGen flatOp@(FlatOp op args idxArgs) = case op of
   NScan' dir -> defaultCodeGenScan' dir flatOp args idxArgs
   NScan dir -> defaultCodeGenScan dir flatOp args idxArgs
 
+type NParLoopCodeGen = ParLoopCodeGen Native CPULoopAnalysis
+
 -- Parallel code generation for one-dimensional collective operations (folds and scans).
 -- Other operations, either OpCodeGenSingle or nested deeper, are handled in opCodeGen
-parCodeGen :: Bool -> FlatOp NativeOp env idxEnv -> Maybe (Exists (ParLoopCodeGen Native env idxEnv))
+parCodeGen :: Bool -> FlatOp NativeOp env idxEnv -> Maybe (Exists (NParLoopCodeGen env idxEnv))
 parCodeGen descending (FlatOp NFold
     (ArgFun fun :>: ArgExp seed :>: input :>: output :>: _)
     (_ :>: _ :>: IdxArgIdx _ inputIdx :>: IdxArgIdx _ outputIdx :>: _))
@@ -488,7 +490,7 @@ parCodeGen descending (FlatOp (NScan dir)
       _ -> internalError "Shape impossible"
 parCodeGen _ _ = Nothing
 
-parCodeGenSharded :: Bool -> FlatOp NativeOp env idxEnv -> Maybe (Exists (ParLoopCodeGen Native env idxEnv))
+parCodeGenSharded :: Bool -> FlatOp NativeOp env idxEnv -> Maybe (Exists (NParLoopCodeGen env idxEnv))
 parCodeGenSharded descending (FlatOp NFold
     (ArgFun fun :>: ArgExp seed :>: input :>: output :>: _)
     (_ :>: _ :>: IdxArgIdx _ inputIdx :>: IdxArgIdx _ outputIdx :>: _))
@@ -509,7 +511,7 @@ parCodeGenFold
   -> Arg env (Out sh e)
   -> ExpVars idxEnv (sh, Int)
   -> ExpVars idxEnv sh
-  -> Exists (ParLoopCodeGen Native env idxEnv)
+  -> Exists (NParLoopCodeGen env idxEnv)
 parCodeGenFold descending fun Nothing input output inputIdx outputIdx
   | Just identity <- if descending then findRightIdentity fun else findLeftIdentity fun
   = parCodeGenFold descending fun (Just $ mkConstant tp identity) input output inputIdx outputIdx
@@ -550,7 +552,7 @@ parCodeGenFoldSharded
   -> ExpVars idxEnv (sh, Int)
   -- Code after the parallel loop
   -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
-  -> Exists (ParLoopCodeGen Native env idxEnv)
+  -> Exists (NParLoopCodeGen env idxEnv)
 parCodeGenFoldSharded descending fun Nothing input index codeEnd
   | Just identity <- if descending then findRightIdentity fun else findLeftIdentity fun
   = parCodeGenFoldSharded descending fun (Just $ mkConstant tp identity) input index codeEnd
@@ -564,7 +566,7 @@ parCodeGenFoldSharded descending fun seed input index codeEnd
   = parCodeGenFoldCommutative descending fun s i input index codeEnd
   | otherwise = Exists $ ParLoopCodeGen
   -- If we know an identity value, we can implement this without loop peeling
-  (isNothing identity)
+  (CPULoopAnalysis $ isNothing identity)
   -- In kernel memory, store the index of the block we must now handle and the
   -- reduced value so far. 'Handle' here means that we should now add the value
   -- of that block.
@@ -618,7 +620,7 @@ parCodeGenFoldSharded descending fun seed input index codeEnd
         tupleStore tp accumVar value
   )
   -- Code within the tile loop
-  (\_ accumVar ptr envs -> do
+  (\_ accumVar _ envs -> do
     x <- readArray' envs input index
     new <-
       if isJust identity then do
@@ -628,26 +630,17 @@ parCodeGenFoldSharded descending fun seed input index codeEnd
         else
           app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
       else do 
-        ptrs <- tuplePtrs' memoryTp ptr
-        
-        case ptrs of
-          TupRsingle shardArray -> do
-            let shardIdx = fromMaybe (internalError "Missing shard index") $ envsShardIdx envs
-            OP_Word64 idxCacheWidth <- A.mul numType (OP_Word64 shardIdx) (A.liftWord64 $ valuesPerCacheLine shardType)
-            startIdx <- tupleLoadArray (TupRsingle scalarTypeInt) NonVolatile shardArray idxCacheWidth shardStartIdxIdx
-            isFirst <- A.eq singleType startIdx (envsTileIndex envs)
-
-            A.ifThenElse (tp, A.land isFirst $ envsIsFirst envs)
-              ( do
-                return x
-              )
-              ( do
-                accum <- tupleLoad tp accumVar
-                if envsDescending envs then
-                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-                else
-                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-              )      
+        A.ifThenElse' (tp, envsIsFirst envs)
+          ( do
+            return x
+          )
+          ( do
+            accum <- tupleLoad tp accumVar
+            if envsDescending envs then
+              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
+            else
+              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
+          )      
     tupleStore tp accumVar new
   )
   -- Code after the tile loop
@@ -777,9 +770,9 @@ parCodeGenFoldCommutative
   -> ExpVars idxEnv (sh, Int)
   -- Code after the parallel loop
   -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
-  -> Exists (ParLoopCodeGen Native env idxEnv)
+  -> Exists (NParLoopCodeGen env idxEnv)
 parCodeGenFoldCommutative _ fun seed identity input index codeEnd = Exists $ ParLoopCodeGen
-  False
+  (CPULoopAnalysis False)
   -- In kernel memory, store a lock (Word8) and the
   -- reduced value so far. The lock must be acquired to read or update the total value.
   -- Value 0 means unlocked, 1 is locked.
@@ -863,8 +856,6 @@ parCodeGenFoldCommutative _ fun seed identity input index codeEnd = Exists $ Par
     memoryTp = TupRsingle scalarTypeWord8 `TupRpair` tp
     ArgArray _ (ArrayR _ tp) _ _ = input
 
-data FoldOrScan = IsFold | IsScan deriving Eq
-
 parCodeGenScan
   :: Bool -- Whether the loop is descending
   -- Whether this is a fold. Folds use similar code generation as scans, hence
@@ -884,7 +875,7 @@ parCodeGenScan
   -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
   -- Code after the parallel loop
   -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
-  -> Exists (ParLoopCodeGen Native env idxEnv)
+  -> Exists (NParLoopCodeGen env idxEnv)
 parCodeGenScan descending foldOrScan fun Nothing input index codeSeed codePre codePost codeEnd
   | Just identity <- if descending then findRightIdentity fun else findLeftIdentity fun
   = parCodeGenScan descending foldOrScan fun (Just $ mkConstant tp identity) input index codeSeed codePre codePost codeEnd
@@ -892,7 +883,7 @@ parCodeGenScan descending foldOrScan fun Nothing input index codeSeed codePre co
     ArgArray _ (ArrayR _ tp) _ _ = input
 parCodeGenScan descending foldOrScan fun seed input index codeSeed codePre codePost codeEnd = Exists $ ParLoopCodeGen
   -- If we know an identity value, we can implement this without loop peeling
-  (isNothing identity)
+  (CPULoopAnalysis $ isNothing identity)
   -- In kernel memory, store the index of the block we must now handle and the
   -- reduced value so far. 'Handle' here means that we should now add the value
   -- of that block.
@@ -1017,24 +1008,9 @@ parCodeGenScan descending foldOrScan fun seed input index codeSeed codePre codeP
             -- as this loop starts with the prefix value of the previous
             -- thread. We can directly write that to kernel memory.
             return local
-          else if isNothing seed then
-            -- If there is no seed, then write the output directly in the first tiles.
-            -- The other tiles must combine their result with the given operator.
-            A.ifThenElse (tp, A.eq singleType (envsTileIndex envs) (A.liftInt 0))
-              (do
-                return local
-              )
-              (do
-                prefix <- tupleLoad tp valuePtrs
-                tupleStore tp accumVar prefix
-                if envsDescending envs then
-                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local prefix
-                else
-                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
-              )
-          -- If there is a seed, then all tile will combine their local result with
-          -- the already available value.
           else do
+            -- Note: if we are not in single threaded mode, then 'envsTileIndex envs /= 0'.
+            -- Hence we know there is always a value available in 'valuePtrs'.
             prefix <- tupleLoad tp valuePtrs
             tupleStore tp accumVar prefix
             if envsDescending envs then
@@ -1063,7 +1039,7 @@ parCodeGenScan descending foldOrScan fun seed input index codeSeed codePre codeP
   -- and we thus should do loop peeling there.
   -- Not executed when this tile is executed in the sequential mode.
   (if foldOrScan == IsFold then Nothing else
-    Just (isNothing seed, \accumVar _ envs -> do
+    Just (CPULoopAnalysis $ isNothing seed, \accumVar _ envs -> do
       x <- readArray' envs input index
       if isJust seed then do
         accum <- tupleLoad tp accumVar
