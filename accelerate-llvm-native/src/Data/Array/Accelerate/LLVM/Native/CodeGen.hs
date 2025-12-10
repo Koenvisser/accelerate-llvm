@@ -114,6 +114,19 @@ codegen name env cluster args
         Nothing -> internalError "Could not generate code for a cluster. Does parCodeGen lack a case for a collective parallel operation?"
         Just (Exists parCodes) -> do
           let hasScan = parCodeGenHasMultipleTileLoops parCodes
+
+          let tileSize =
+                if rank shr > 1 then
+                  32
+                else if hasScan then
+                  -- We need to choose a tile size such that the values in the
+                  -- first tile loop (the reduce step of the chained scan) are
+                  -- still in the cache during the second tile loop (the scan
+                  -- step of the chained scan).
+                  1024 * 2
+                else
+                  maxTileSize
+
           -- f = I / 2 * threads, l = 1
           f <- do 
             f' <- A.quot TypeInt size (A.liftInt $ 2 * threads)
@@ -121,14 +134,9 @@ codegen name env cluster args
           let l = A.liftInt 32
                   
           tileCount <- 
-                if rank shr > 1 then do
-                  let tileSize' = A.liftInt 32
-                  sizeAdd <- A.add numType size (A.liftInt $ 32 - 1)
-                  A.quot TypeInt sizeAdd tileSize'
-                else if hasScan then do
-                  let tileSize' = A.liftInt $ 1024 * 2
-                  sizeAdd <- A.add numType size (A.liftInt $ (1024 * 2) - 1)
-                  A.quot TypeInt sizeAdd tileSize'
+                if rank shr > 1 || hasScan then do
+                  sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
+                  A.quot TypeInt sizeAdd $ A.liftInt tileSize
                 else do
                   -- N = ceil(2 * I / (f + l))
                   numerator <- A.mul numType (A.liftInt 2) size
@@ -231,7 +239,7 @@ codegen name env cluster args
           -- TODO: We can make this more precise by tracking whether arrays are
           -- only used in one tile loop. These arrays can also be stored as a
           -- single value.
-          envs'' <- bindLocalsInTile (\_ -> not $ null $ ptOtherLoops tileLoops) 1 maxTileSize envs'
+          envs'' <- bindLocalsInTile (\_ -> not $ null $ ptOtherLoops tileLoops) 1 tileSize envs'
           workassistLoop workassistIndex tileCountWord64 $ \seqMode tileIdx' -> do
             tileIdx <- instr' $ BitCast scalarType tileIdx'
 
