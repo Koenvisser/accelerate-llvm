@@ -101,6 +101,7 @@ codegen name env cluster args
     _ <- switch (OP_Word64 workassistFirstIndex) workBlock [(0xFFFFFFFF, initBlock), (0xFFFFFFFE, finishBlock)]
     let hasPermute = hasNPermute flat
     let threads = fromIntegral $ unsafePerformIO threadCount :: Int
+    
     let maxTileSize = 1024 * 1024
 
     if parallelDepth == 0 && rank shr /= 0 then do
@@ -128,68 +129,65 @@ codegen name env cluster args
                   maxTileSize
 
           -- f = I / 2 * threads, l = 1
-          f <- do 
-            f' <- A.quot TypeInt size (A.liftInt $ 2 * threads)
-            A.min singleType f' (A.liftInt maxTileSize)
           let l = A.liftInt 32
+          f <- do 
+            f' <- A.quot integralType size (A.liftInt $ 2 * threads)
+            f'' <- A.max singleType f' l
+            A.min singleType f'' (A.liftInt maxTileSize)
                   
           tileCount <- 
                 if rank shr > 1 || hasScan then do
                   sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
-                  A.quot TypeInt sizeAdd $ A.liftInt tileSize
+                  A.quot integralType sizeAdd $ A.liftInt tileSize
                 else do
                   -- N = ceil(2 * I / (f + l))
                   numerator <- A.mul numType (A.liftInt 2) size
                   denom <- A.add numType f l
                   denomMin1 <- A.sub numType denom (A.liftInt 1)
                   numeratorAdd <- A.add numType numerator denomMin1
-                  A.quot TypeInt numeratorAdd denom
+                  A.quot integralType numeratorAdd denom
 
-          let tileIndices :: Operands Int -> CodeGen Native (Operands Int, Operands Int)
+          let tileIndices :: Operands Int -> CodeGen Native (Operands (Int, Int))
               tileIndices tileIdx = do
-                if rank shr > 1 then do
+                if rank shr > 1 || hasScan then do
                   -- startOfTile = tileIdx * tileSize
-                  start <- A.mul numType tileIdx (A.liftInt 32)
-                  end <- A.add numType start (A.liftInt 32)
-                  return (start, end)
-                else if hasScan then do
-                  -- startOfTile = tileIdx * tileSize
-                  start <- A.mul numType tileIdx (A.liftInt $ 1024 * 2)
-                  end <- A.add numType start (A.liftInt $ 1024 * 2)
-                  return (start, end)
+                  start <- A.mul numType tileIdx (A.liftInt tileSize)
+                  end <- A.add numType start (A.liftInt tileSize)
+                  return $ OP_Pair start end
                 else do
-                  -- start = fi - ((i - 1) * i * (f - l) * (f + l)) / (2 * (2I - f - l))
-                  -- end   = f(i + 1) - (i* (i + 1) * (f - l) * (f + l)) / (2 * (2I - f - l))
-                  let i = tileIdx
-                  iMinus1 <- A.sub numType i (A.liftInt 1)
-                  iPlus1 <- A.add numType i (A.liftInt 1)
-                  fi <- A.mul numType f i
-                  fi1 <- A.mul numType f iPlus1
-                  fMinusL <- A.sub numType f l
-                  nMinus1 <- A.sub numType tileCount (A.liftInt 1)
-                  denom <- A.mul numType (A.liftInt 2) nMinus1
-                  numerator <- A.mul numType fMinusL i
-                  numerStart <- A.mul numType iMinus1 numerator
-                  startSub <- A.quot integralType numerStart denom
-                  start <- A.sub numType fi startSub
-                  numerEnd <- A.mul numType numerator iPlus1
-                  endSub <- A.quot integralType numerEnd denom
-                  end <- A.sub numType fi1 endSub
+                  -- start = fi - ((i - 1) * i * (f - l)) / (2 * (N - 1))
+                  -- end   = f(i + 1) - ((i + 1) * i * (f - l)) / (2 * (N - 1))
 
-                  start' <- A.min singleType start size
-                  end' <- A.min singleType end size
+                  A.ifThenElse (TupRpair (TupRsingle scalarTypeInt) (TupRsingle scalarTypeInt), A.lte singleType tileCount (A.liftInt 1))
+                    -- Single tile
+                    (do
+                      let start = A.liftInt 0
+                      let end = size
+                      return $ OP_Pair start end
+                    )
+                    -- Multiple tiles
+                    (do
+                      let i = tileIdx
+                      iMinus1 <- A.sub numType i (A.liftInt 1)
+                      iPlus1 <- A.add numType i (A.liftInt 1)
+                      fi <- A.mul numType f i
+                      fi1 <- A.mul numType f iPlus1
+                      fMinusL <- A.sub numType f l
+                      nMinus1 <- A.sub numType tileCount (A.liftInt 1)
+                      denom <- A.mul numType (A.liftInt 2) nMinus1
+                      numerator <- A.mul numType fMinusL i
+                      numerStart <- A.mul numType iMinus1 numerator
+                      startSub <- A.quot integralType numerStart denom
+                      start <- A.sub numType fi startSub
+                      numerEnd <- A.mul numType numerator iPlus1
+                      endSub <- A.quot integralType numerEnd denom
+                      end <- A.sub numType fi1 endSub
 
-                  -- _ <- putString "chunkBounds i="
-                  -- _ <- putInt i
-                  -- _ <- putString "\n"
-                  -- _ <- putString "  start="
-                  -- _ <- putInt start'
-                  -- _ <- putString "\n"
-                  -- _ <- putString "  end="
-                  -- _ <- putInt end'
-                  -- _ <- putString "\n"
+                      start' <- A.min singleType start size
+                      end' <- A.min singleType end size
 
-                  return (start', end')
+                      return $ OP_Pair start' end'
+                    )
           
           let envs' = envs{
             envsLoopDepth = 0,
@@ -248,12 +246,12 @@ codegen name env cluster args
               -- The first block (with tileIdx 0) should now correspond with the last
               -- values of the array. We implement that by reversing the tile indices here.
               if isDescending direction then do
-                i <- A.sub numType (OP_Int tileCount') (OP_Int tileIdx)
+                i <- A.sub numType tileCount (OP_Int tileIdx)
                 OP_Int j <- A.sub numType i (A.liftInt 1)
                 return j
               else
                 return tileIdx
-            (lower, upper') <- tileIndices (OP_Int tileIdxAbsolute)
+            OP_Pair lower upper' <- tileIndices (OP_Int tileIdxAbsolute)
             upper <- A.min singleType upper' size
 
             -- If there is only a single tile loop (i.e. no parallel scans),

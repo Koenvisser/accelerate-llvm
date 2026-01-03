@@ -246,7 +246,7 @@ chunkCount (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair fs f) = do
   counts <- chunkCount shr sh fs
   -- N = ceil(2 * I / (f + l))
   -- f = I / 2 * threads, l = 1
-  let l = A.liftInt 1
+  let l = A.liftInt 32
   numerator <- A.mul numType (A.liftInt 2) sz
   denom <- A.add numType f l
   denomMin1 <- A.sub numType denom (A.liftInt 1)
@@ -267,36 +267,39 @@ chunkBounds (ShapeRsnoc shr) (OP_Pair sh sz) (OP_Pair idxSh idx) (OP_Pair fs f) 
   (startIxs, endIxs) <- chunkBounds shr sh idxSh fs ts
   -- start = fi - ((i - 1) * i * (f - l)) / (2 * (N - 1))
   -- end   = f(i + 1) - ((i + 1) * i * (f - l)) / (2 * (N - 1))
-  let i = idx
-  iMinus1 <- A.sub numType i (A.liftInt 1)
-  iPlus1 <- A.add numType i (A.liftInt 1)
-  fi <- A.mul numType f i
-  fi1 <- A.mul numType f iPlus1
-  fMinusL <- A.sub numType f (A.liftInt 32)
-  nMinus1 <- A.sub numType t (A.liftInt 1)
-  denom <- A.mul numType (A.liftInt 2) nMinus1
-  numerator <- A.mul numType fMinusL i
-  numerStart <- A.mul numType iMinus1 numerator
-  startSub <- A.quot integralType numerStart denom
-  start <- A.sub numType fi startSub
-  numerEnd <- A.mul numType numerator iPlus1
-  endSub <- A.quot integralType numerEnd denom
-  end <- A.sub numType fi1 endSub
+  OP_Pair start end <- A.ifThenElse (TupRpair (TupRsingle scalarTypeInt) (TupRsingle scalarTypeInt), A.lte singleType t (A.liftInt 1))
+    -- Single tile
+    (do
+      let start = A.liftInt 0
+      let end = sz
+      return $ OP_Pair start end
+    )
+    (
+      do 
+        let l = A.liftInt 32
+        let i = idx
+        iMinus1 <- A.sub numType i (A.liftInt 1)
+        iPlus1 <- A.add numType i (A.liftInt 1)
+        fi <- A.mul numType f i
+        fi1 <- A.mul numType f iPlus1
+        fMinusL <- A.sub numType f l
+        nMinus1 <- A.sub numType t (A.liftInt 1)
+        denom <- A.mul numType (A.liftInt 2) nMinus1
+        numerator <- A.mul numType fMinusL i
+        numerStart <- A.mul numType iMinus1 numerator
+        startSub <- A.quot integralType numerStart denom
+        start <- A.sub numType fi startSub
+        numerEnd <- A.mul numType numerator iPlus1
+        endSub <- A.quot integralType numerEnd denom
+        end <- A.sub numType fi1 endSub
 
-  start' <- A.min singleType start sz
-  end' <- A.min singleType end sz
+        start' <- A.min singleType start sz
+        end' <- A.min singleType end sz
 
-  -- _ <- putString "chunkBounds i="
-  -- _ <- putInt i
-  -- _ <- putString "\n"
-  -- _ <- putString "start="
-  -- _ <- putInt start'
-  -- _ <- putString "\n"
-  -- _ <- putString "end="
-  -- _ <- putInt end'
-  -- _ <- putString "\n"
+        return $ OP_Pair start' end'
+    )
 
-  return (OP_Pair startIxs start', OP_Pair endIxs end')
+  return (OP_Pair startIxs start, OP_Pair endIxs end)
 
 atomicAdd :: MemoryOrdering -> Operand (Ptr Word64) -> Operand Word64 -> CodeGen Native (Operand Word64)
 atomicAdd ordering ptr increment = do
