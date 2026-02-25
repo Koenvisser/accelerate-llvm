@@ -72,7 +72,6 @@ import Data.Array.Accelerate.LLVM.Native.CodeGen.Loop
 import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.CodeGen.Constant
 import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty as LP
-import qualified Text.LLVM as LP
 import GHC.IO (unsafePerformIO)
 import GHC.Conc (getNumProcessors)
 import System.Environment (lookupEnv)
