@@ -7,6 +7,7 @@
 #include "types.h"
 #include <unistd.h>
 #include <sched.h>
+#include <string.h>
 
 struct RuntimeLib accelerate_runtime_lib = (struct RuntimeLib){
   .accelerate_buffer_alloc = accelerate_buffer_alloc,
@@ -54,6 +55,28 @@ void accelerate_parker_wake_all(struct ThreadParker *parker) {
 
 #define ATTEMPTS 16
 
+static uint64_t get_cache_line_size(void) {
+  #ifdef __linux__
+    // Method 1: sysconf
+    long size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+    if (size > 0) return (uint64_t)size;
+    
+    // Method 2: Read from sysfs
+    FILE *f = fopen("/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size", "r");
+    if (f) {
+      int val;
+      if (fscanf(f, "%d", &val) == 1) {
+        fclose(f);
+        return (uint64_t)val;
+      }
+      fclose(f);
+    }
+  #endif
+  
+  // Fallback: conservative default (works for x86-64 and most ARM)
+  return 128;
+}
+
 void* accelerate_worker(void *data_packed) {
   struct Workers *workers = accelerate_unpack_ptr((uintptr_t) data_packed);
   uint16_t thread_idx = accelerate_unpack_tag((uintptr_t) data_packed);
@@ -92,6 +115,13 @@ void* accelerate_worker(void *data_packed) {
         task.program = NULL;
         task.location = 0;
       } else {
+
+        kernel->cache_line_size = get_cache_line_size();
+
+        size_t buffer_size = SHARD_AMOUNT * kernel->cache_line_size;
+        kernel->shards = aligned_alloc(kernel->cache_line_size, buffer_size);
+        memset(kernel->shards, 0, buffer_size);
+
         // Initialize kernel memory and check if the kernel should be executed in parallel.
         unsigned char parallel =
           kernel->work_function(kernel, workers->locks, 0xFFFFFFFF);

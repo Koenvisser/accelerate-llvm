@@ -35,27 +35,10 @@ import LLVM.AST.Type.Operand
 
 import Data.String
 import qualified Data.ByteString.Short.Char8                        as S8
+import LLVM.AST.Type.Instruction.Volatile (Volatility(NonVolatile))
 
 shardAmount :: Word64
 shardAmount = 128
-
-cacheWidth :: Word64
-cacheWidth = 64
-
--- Calculates how many values are needed to fill a cache line
-class CalcValuesPerCacheLine t where
-  valuesPerCacheLine :: t a -> Word64
-
-instance CalcValuesPerCacheLine PrimType where
-  valuesPerCacheLine tp = (cacheWidth + byteSize - 1) `div` byteSize    
-    where byteSize = fromIntegral (fst (primSizeAlignment tp))
-
-instance CalcValuesPerCacheLine ScalarType where
-  valuesPerCacheLine tp = valuesPerCacheLine $ ScalarPrimType tp
-
-instance CalcValuesPerCacheLine TypeR where
-  valuesPerCacheLine tp = (cacheWidth + byteSize - 1) `div` byteSize
-    where byteSize = fromIntegral (bytesElt tp)
 
 -- The struct passed as argument to a call contains:
 --  * work_function: ptr
@@ -66,14 +49,15 @@ instance CalcValuesPerCacheLine TypeR where
 -- We store the work function as a pointer to a struct, as that makes it easy
 -- to separate pointers to a kernel from pointers to buffers, when compiling
 -- a schedule.
-type Header = ((((((Ptr (Struct Int8), Ptr Int8), Word32), Word32), SizedArray Word64), SizedArray Word64), Word64)
+type Header = (((((((Ptr (Struct Int8), Ptr Int8), Word32), Word32), Word64), Ptr Word8), SizedArray Word64), Word64)
 
 headerType :: TupR PrimType Header
 headerType = TupRsingle (PtrPrimType (StructPrimType False $ TupRsingle primType) defaultAddrSpace)
   `TupRpair` TupRsingle primType
   `TupRpair` TupRsingle primType
   `TupRpair` TupRsingle primType
-  `TupRpair` TupRsingle (ArrayPrimType (shardAmount * valuesPerCacheLine scalarTypeWord64) primType)
+  `TupRpair` TupRsingle primType
+  `TupRpair` TupRsingle (PtrPrimType primType defaultAddrSpace)
   `TupRpair` TupRsingle (ArrayPrimType shardAmount primType)
   `TupRpair` TupRsingle primType
 
@@ -91,7 +75,8 @@ bindHeaderEnv
   :: forall env. Env AccessGroundR env
   -> ( PrimType (Ptr (Struct ((Header, Struct (MarshalEnv env)), SizedArray Word)))
      , CodeGen Native ()
-     , Operand (Ptr (SizedArray Word64))  -- work indexes of shards
+     , Operand (Ptr Word8)  -- work indexes of shards
+     , Operand (Ptr Word64)       -- Cache line width in bytes
      , Operand (Ptr (SizedArray Word64))  -- sizes of the shards
      , Operand (Ptr Word64)               -- In the case of workassist, the workassist index.
        -- In the case of sharded self scheduling, combined the next shard and amount of finished shards.
@@ -102,13 +87,16 @@ bindHeaderEnv
 bindHeaderEnv env =
   ( argTp
   , do
-      instr_ $ downcast $ nameShards         := GetElementPtr (gepStruct (ArrayPrimType (shardAmount * valuesPerCacheLine scalarTypeWord64) (ScalarPrimType scalarType)) arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
+      shards <- instr' $ GetElementPtr (gepStruct (PtrPrimType primType defaultAddrSpace) arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
+      instr_ $ downcast $ nameShards'        := LoadPtr NonVolatile shards
+      instr_ $ downcast $ nameCacheLineWidth := GetElementPtr (gepStruct primType arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
       instr_ $ downcast $ nameShardSizes     := GetElementPtr (gepStruct (ArrayPrimType shardAmount (ScalarPrimType scalarType)) arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
       instr_ $ downcast $ nameIndex          := GetElementPtr (gepStruct primType arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
       instr_ $ downcast $ "env"              := GetElementPtr (gepStruct envTp arg $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
       instr_ $ downcast $ nameKernelMemory   := GetElementPtr (gepStruct kernelMemTp arg $ TupleIdxRight TupleIdxSelf)
       extractEnv
-  , LocalReference (PrimType $ PtrPrimType (ArrayPrimType (shardAmount * valuesPerCacheLine scalarTypeWord64) (ScalarPrimType scalarType)) defaultAddrSpace) nameShards
+  , LocalReference (PrimType $ PtrPrimType primType defaultAddrSpace) nameShards'
+  , LocalReference (PrimType $ PtrPrimType primType defaultAddrSpace) nameCacheLineWidth
   , LocalReference (PrimType $ PtrPrimType (ArrayPrimType shardAmount (ScalarPrimType scalarType)) defaultAddrSpace) nameShardSizes
   , LocalReference (PrimType $ PtrPrimType (ScalarPrimType scalarType) defaultAddrSpace) nameIndex
   , LocalReference type' nameFlag
@@ -123,6 +111,8 @@ bindHeaderEnv env =
     (envTp, extractEnv, gamma) = bindEnvFromStruct env
 
     nameShards = "workassist.shards"
+    nameShards' = "workassist.shards"
+    nameCacheLineWidth = "workassist.cache_line_size"
     nameShardSizes = "workassist.shard_sizes"
     nameIndex = "workassist.index"
     nameFlag = "workassist.flag"

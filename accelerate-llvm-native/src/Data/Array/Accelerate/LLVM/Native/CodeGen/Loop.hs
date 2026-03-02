@@ -21,7 +21,6 @@ module Data.Array.Accelerate.LLVM.Native.CodeGen.Loop
 import Data.Array.Accelerate.Representation.Type
 import Data.Array.Accelerate.Representation.Shape                   hiding ( eq )
 
-import Data.Array.Accelerate.LLVM.Native.CodeGen.Base               (valuesPerCacheLine)
 import Data.Array.Accelerate.LLVM.CodeGen.Arithmetic                hiding ( lift )
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Arithmetic      as A
 import Data.Array.Accelerate.LLVM.CodeGen.Constant
@@ -186,13 +185,14 @@ iterFromTo tp start end seed body =
 -- Can only be used for independent operations, as tiles are not guaranteed to be executed in order.
 -- Shards must be initialised before calling this function.
 shardedSelfScheduling
-    :: Operand (Ptr (SizedArray Word64))    -- work indexes of shards
+    :: Operand (Ptr Word8)    -- work indexes of shards
     -> Operand (Ptr (SizedArray Word64))    -- sizes of shards
     -> Operand (Ptr Word64)                 -- combined: high 32 bits = next shard index, low 32 bits = finished shard count
-    -> Operands Word64                       -- amount of shards
+    -> Operand (Ptr Word64)                 -- Cache line width in bytes
+    -> Operands Word64                      -- amount of shards
     -> (Operand Bool -> Operand Word64 -> Operand Word64 -> CodeGen Native ())
     -> CodeGen Native ()
-shardedSelfScheduling shardIndexes shardSizes nextShardFinishedShards shardAmount' doWork = do
+shardedSelfScheduling shardIndexes shardSizes nextShardFinishedShards cacheLineWidth shardAmount' doWork = do
   -- The sharded self scheduling loop is structured as follows:
   -- 1. Claim a shard by incrementing the next shard index (high 32 bits of nextShardFinishedShards) by 1.
   -- 2. Check if work is done by comparing the amount of finished shards (low 32 bits of nextShardFinishedShards) 
@@ -210,6 +210,8 @@ shardedSelfScheduling shardIndexes shardSizes nextShardFinishedShards shardAmoun
   finish   <- newBlock "workassist.shards.done.finish"
   next     <- newBlock "workassist.shards.done.next"
   exit     <- newBlock "workassist.exit"
+
+  cacheLineWidth' <- instr $ Load scalarType NonVolatile cacheLineWidth
 
   -- Increment next shard by 1.
   initNextFinish <- atomicAdd Monotonic nextShardFinishedShards (integral TypeWord64 0x100000000)
@@ -246,8 +248,9 @@ shardedSelfScheduling shardIndexes shardSizes nextShardFinishedShards shardAmoun
   OP_Word64 shardToWorkOn <- A.rem TypeWord64 nextShard' shardAmount'
 
   -- Get shard from shards array, to do this we need to multiply by cache width as every shards is on a separate cache line.
-  OP_Word64 shardIdx <- A.mul numType (A.liftWord64 $ valuesPerCacheLine scalarTypeWord64) (OP_Word64 shardToWorkOn)
-  shard <- instr' $ GetElementPtr $ GEP shardIndexes (integral TypeWord64 0) $ GEPArray shardIdx GEPEmpty
+  OP_Word64 shardIdx <- A.mul numType (OP_Word64 shardToWorkOn) cacheLineWidth'
+  shard <- instr' $ GetElementPtr $ GEP shardIndexes shardIdx GEPEmpty
+  shard' <- instr' $ PtrCast primType shard
   
   -- Get shard size from shard sizes array, no need to multiply by cache width as shard sizes are only read.
   shardSizeIdx <- instr' $ GetElementPtr $ GEP shardSizes (integral TypeWord64 0) $ GEPArray shardToWorkOn GEPEmpty
@@ -258,7 +261,7 @@ shardedSelfScheduling shardIndexes shardSizes nextShardFinishedShards shardAmoun
   setBlock inner
   
   -- Continue working on shard until finished.
-  workIdx <- atomicAdd Monotonic shard (integral TypeWord64 1)
+  workIdx <- atomicAdd Monotonic shard' (integral TypeWord64 1)
   shardFinished <- A.lt singleType (OP_Word64 workIdx) (OP_Word64 shardSize)
 
   _ <- cbr shardFinished work done
@@ -284,18 +287,19 @@ shardedSelfScheduling shardIndexes shardSizes nextShardFinishedShards shardAmoun
 shardedSelfSchedulingChunked 
     :: [Loop.LoopAnnotation] 
     -> ShapeR sh 
-    -> Operand (Ptr (SizedArray Word64))    -- work indexes of shards
+    -> Operand (Ptr Word8)                  -- work indexes of shards
     -> Operand (Ptr (SizedArray Word64))    -- sizes of shards
     -> Operand (Ptr Word64)                 -- combined: high 32 bits = next shard index, low 32 bits = finished shard count
+    -> Operand (Ptr Word64) -- Cache line width in bytes
     -> Operands Word64                      -- amount of shards
     -> sh 
     -> Operands sh
     -> Operands sh
     -> (Operands sh -> Operand Word64 -> CodeGen Native ())
     -> CodeGen Native ()
-shardedSelfSchedulingChunked ann shr shardIndexes shardSizes nextShardFinishedShards shardAmount' chunkSz' sh chunkCounts doWork = do
+shardedSelfSchedulingChunked ann shr shardIndexes shardSizes nextShardFinishedShards cacheLineWidth shardAmount' chunkSz' sh chunkCounts doWork = do
   let chunkSz = A.lift (shapeType shr) chunkSz'
-  shardedSelfScheduling shardIndexes shardSizes nextShardFinishedShards shardAmount' $ \_ chunkLinearIndex shardIdx -> do
+  shardedSelfScheduling shardIndexes shardSizes nextShardFinishedShards cacheLineWidth shardAmount' $ \_ chunkLinearIndex shardIdx -> do
     chunkLinearIndex' <- instr' $ BitCast scalarType chunkLinearIndex
     chunkIndex <- indexOfInt shr chunkCounts (OP_Int chunkLinearIndex')
     start <- chunkStart shr chunkSz chunkIndex
