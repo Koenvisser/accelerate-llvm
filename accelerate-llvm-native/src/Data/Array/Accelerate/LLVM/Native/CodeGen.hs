@@ -93,10 +93,11 @@ codegen name env cluster args
     -- Before the parallel work of a kernel is started, we first run the function once.
     -- This first call will initialize kernel memory (SEE: Kernel Memory)
     -- and decide whether the runtime may try to let multiple threads work on this kernel.
+    allocBlock <- newBlock "alloc"
     initBlock <- newBlock "init"
     finishBlock <- newBlock "finish" -- Finish function from the work assisting paper
     workBlock <- newBlock "work"
-    _ <- switch (OP_Word64 flag) workBlock [(0xFFFFFFFF, initBlock), (0xFFFFFFFE, finishBlock)]
+    _ <- switch (OP_Word64 flag) workBlock [(0xFFFFFFFF, initBlock), (0xFFFFFFFE, finishBlock), (0xFFFFFFFD, allocBlock)]
     let hasPermute = hasNPermute flat
     let useSharded = hasFold flat && not (hasScan flat)
 
@@ -108,7 +109,7 @@ codegen name env cluster args
 
       -- Parallelise over first dimension using parallel folds or scans
       case parCodeGens (
-        (if useSharded then parCodeGenSharded cacheLineWidth else parCodeGen) -- Use sharded if operation has a fold
+        (if useSharded then parCodeGenSharded cacheLineWidth shardsFold else parCodeGen) -- Use sharded if operation has a fold
         (isDescending direction)) 0 $ opCodeGens opCodeGen flatOps of
         Nothing -> internalError "Could not generate code for a cluster. Does parCodeGen lack a case for a collective parallel operation?"
         Just (Exists parCodes) -> do
@@ -133,9 +134,27 @@ codegen name env cluster args
           let memoryTp = StructPrimType False memoryTp'
           kernelMem <- instr' $ PtrCast (PtrPrimType memoryTp defaultAddrSpace) kernelMem'
 
-          setBlock initBlock
+          setBlock allocBlock
           do
             -- Number of tiles
+            sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
+            OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
+
+            -- Flag bits:
+            -- 0x1: Whether to run in parallel (1) or sequential (0).
+            -- 0x2: Whether to use sharded self scheduling (1) or self scheduling (0).
+            -- 0x4: Whether to use sharded self scheduling with folds (1) or not (0).
+            -- Here we always use sharded self scheduling for folds, so we either set to 0x6 or 0x0.
+            let flag = if useSharded then 0x6 else 0x0
+
+            -- Decide whether tileCount is large enough
+            OP_Bool isSmall <- A.lt singleType (OP_Int tileCount') $ A.liftInt 2
+            value <- instr' $ Select isSmall (scalar (scalarType @Word8) flag) (scalar scalarType (flag + 1))
+            retval_ value
+
+          -- Initialise shards if we use sharded self scheduling
+          setBlock initBlock
+          do
             sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
             OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
             tileCount <- instr' $ BitCast scalarType tileCount'
@@ -147,12 +166,8 @@ codegen name env cluster args
             -- Initialize kernel memory
             parCodeGenInitMemory kernelMem envs'' TupleIdxSelf parCodes
 
-            when useSharded $ initShards shardIndexes shardSizes workassistIndex cacheLineWidth (OP_Word64 tileCount)
-
-            -- Decide whether tileCount is large enough
-            OP_Bool isSmall <- A.lt singleType (OP_Int tileCount') $ A.liftInt 2
-            value <- instr' $ Select isSmall (scalar (scalarType @Word8) 0) (scalar scalarType 1)
-            retval_ value
+            initShards shardIndexes shardSizes workassistIndex cacheLineWidth (OP_Word64 tileCount)
+            retval_ $ scalar (scalarType @Word8) 0
 
           setBlock finishBlock
           do
@@ -316,20 +331,25 @@ codegen name env cluster args
       let tileSize = if parallelDepth == rank shr then chunkSize parallelShr else chunkSizeOne parallelShr
       let parSizes = parallelIterSize parallelShr loops
 
-      setBlock initBlock
+      setBlock allocBlock
       do
         tileCount <- chunkCount parallelShr parSizes (A.lift (shapeType parallelShr) tileSize)
         tileCount' <- shapeSize parallelShr tileCount
 
         -- We are not using kernel memory, so no need to initialize it.
 
-        tileCount64 <- A.fromIntegral TypeInt (IntegralNumType TypeWord64) tileCount'
-        initShards shardIndexes shardSizes workassistIndex cacheLineWidth tileCount64
-
         OP_Bool isSmall <- A.lt singleType tileCount' $ A.liftInt 2
-        value <- instr' $ Select isSmall (scalar (scalarType @Word8) 0) (scalar scalarType 1)
+        value <- instr' $ Select isSmall (scalar (scalarType @Word8) 0x2) (scalar scalarType 0x3)
 
         retval_ value
+
+      setBlock initBlock
+      do 
+        tileCount <- chunkCount parallelShr parSizes (A.lift (shapeType parallelShr) tileSize)
+        tileCount' <- shapeSize parallelShr tileCount
+        tileCount64 <- A.fromIntegral TypeInt (IntegralNumType TypeWord64) tileCount'
+        initShards shardIndexes shardSizes workassistIndex cacheLineWidth tileCount64
+        retval_ $ scalar (scalarType @Word8) 0
 
       setBlock finishBlock
       do
@@ -362,7 +382,7 @@ codegen name env cluster args
 
         pure 0
   where
-    (argTp, extractEnv, shardIndexes, cacheLineWidth, shardSizes, workassistIndex, flag, kernelMem', gamma) = bindHeaderEnv env
+    (argTp, extractEnv, shardIndexes, shardsFold, cacheLineWidth, shardSizes, workassistIndex, flag, kernelMem', gamma) = bindHeaderEnv env
 
     isDescending :: LoopDirection Int -> Bool
     isDescending LoopDescending = True
@@ -490,18 +510,23 @@ parCodeGen descending (FlatOp (NScan dir)
       _ -> internalError "Shape impossible"
 parCodeGen _ _ = Nothing
 
-parCodeGenSharded :: Operand (Ptr Word64) -> Bool -> FlatOp NativeOp env idxEnv -> Maybe (Exists (NParLoopCodeGen env idxEnv))
-parCodeGenSharded cacheLineWidth descending (FlatOp NFold
+parCodeGenSharded 
+  :: Operand (Ptr Word64) 
+  -> Operand (Ptr Word8)
+  -> Bool 
+  -> FlatOp NativeOp env idxEnv 
+  -> Maybe (Exists (NParLoopCodeGen env idxEnv))
+parCodeGenSharded cacheLineWidth shards descending (FlatOp NFold
     (ArgFun fun :>: ArgExp seed :>: input :>: output :>: _)
     (_ :>: _ :>: IdxArgIdx _ inputIdx :>: IdxArgIdx _ outputIdx :>: _))
-  = Just $ parCodeGenFoldSharded cacheLineWidth descending fun (Just seed) input inputIdx 
+  = Just $ parCodeGenFoldSharded cacheLineWidth shards descending fun (Just seed) input inputIdx 
     (\envs result -> writeArray' envs output outputIdx result)
-parCodeGenSharded cacheLineWidth descending (FlatOp NFold1
+parCodeGenSharded cacheLineWidth shards descending (FlatOp NFold1
     (ArgFun fun :>: input :>: output :>: _)
     (_ :>: IdxArgIdx _ inputIdx :>: IdxArgIdx _ outputIdx :>: _))
-  = Just $ parCodeGenFoldSharded cacheLineWidth descending fun Nothing input inputIdx
+  = Just $ parCodeGenFoldSharded cacheLineWidth shards descending fun Nothing input inputIdx
     (\envs result -> writeArray' envs output outputIdx result)
-parCodeGenSharded _ _ _ = Nothing
+parCodeGenSharded _ _ _ _ = Nothing
 
 parCodeGenFold
   :: Bool
@@ -546,6 +571,7 @@ parCodeGenFold descending fun seed input output inputIdx outputIdx
 parCodeGenFoldSharded
   :: forall env idxEnv sh e.
      Operand (Ptr Word64) -- Cache line width in bytes
+  -> Operand (Ptr Word8)  -- Indexes of the shards
   -> Bool -- Whether the loop is descending
   -> Fun env (e -> e -> e)
   -> Maybe (Exp env e) -- Seed
@@ -554,12 +580,12 @@ parCodeGenFoldSharded
   -- Code after the parallel loop
   -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
   -> Exists (NParLoopCodeGen env idxEnv)
-parCodeGenFoldSharded cacheLineWidth descending fun Nothing input index codeEnd
+parCodeGenFoldSharded cacheLineWidth shards descending fun Nothing input index codeEnd
   | Just identity <- if descending then findRightIdentity fun else findLeftIdentity fun
-  = parCodeGenFoldSharded cacheLineWidth descending fun (Just $ mkConstant tp identity) input index codeEnd
+  = parCodeGenFoldSharded cacheLineWidth shards descending fun (Just $ mkConstant tp identity) input index codeEnd
   where
     ArgArray _ (ArrayR _ tp) _ _ = input
-parCodeGenFoldSharded cacheLineWidth descending fun seed input index codeEnd 
+parCodeGenFoldSharded cacheLineWidth shards descending fun seed input index codeEnd 
   | isCommutative fun
   , Just s <- seed
   , Just i <- identity
@@ -573,43 +599,43 @@ parCodeGenFoldSharded cacheLineWidth descending fun seed input index codeEnd
   -- of that block.
   memoryTp
   -- Initialize kernel memory
-  (\ptr envs -> do
-    ptrs <- tuplePtrs' memoryTp ptr
-    case ptrs of
-      TupRsingle shardArray -> do
-        let tileCount = envsTileCount envs
+  (\_ envs -> do
+    let tileCount = envsTileCount envs
 
-        -- Initialize shardIndexes and shardStartIndexes the same way as in initShards
-        shardAmount' <- A.min singleType (A.liftInt $ fromIntegral shardAmount) (OP_Int tileCount)
-        cacheLineWidth' <- instr $ Load scalarType NonVolatile cacheLineWidth
-                
-        imapFromStepTo [] (A.liftInt 0) (A.liftInt 1) shardAmount' (\(OP_Int idx) -> do
-          shardStartNum <- A.mul numType (OP_Int tileCount) (OP_Int idx)
-          shardStart <- A.quot TypeInt shardStartNum shardAmount'
+    shardArray <- instr' $ PtrCast (PtrPrimType (ArrayPrimType 0 shardType) defaultAddrSpace) shards
 
-          -- Multiply the index by the cache width in bytes to ensure every shard is on a separate cache line.
-          OP_Int idxCacheWidth <- A.mul numType (OP_Int idx) (A.liftInt $ fromIntegral $ valuesPerCacheLine shardType)
-          _ <- tupleStoreArray (TupRsingle scalarTypeInt) Volatile shardArray idxCacheWidth shardIdxIdx shardStart
-          _ <- tupleStoreArray (TupRsingle scalarTypeInt) NonVolatile shardArray idxCacheWidth shardStartIdxIdx shardStart
-          return ()
+    -- Initialize shardIndexes and shardStartIndexes the same way as in initShards
+    shardAmount' <- A.min singleType (A.liftInt $ fromIntegral shardAmount) (OP_Int tileCount)
+    OP_Word64 cacheLineWidth' <- instr $ Load scalarType NonVolatile cacheLineWidth
+    cacheLineWidth'' <- instr' $ BitCast scalarType cacheLineWidth'
+            
+    imapFromStepTo [] (A.liftInt 0) (A.liftInt 1) shardAmount' (\(OP_Int idx) -> do
+      shardStartNum <- A.mul numType (OP_Int tileCount) (OP_Int idx)
+      shardStart <- A.quot TypeInt shardStartNum shardAmount'
+
+      -- Multiply the index by the cache width in bytes to ensure every shard is on a separate cache line.
+      OP_Int idxCacheWidth <- A.mul numType (OP_Int idx) (OP_Int cacheLineWidth'')
+      _ <- tupleStoreArray (TupRsingle scalarTypeInt) Volatile shardArray idxCacheWidth shardIdxIdx shardStart
+      _ <- tupleStoreArray (TupRsingle scalarTypeInt) NonVolatile shardArray idxCacheWidth shardStartIdxIdx shardStart
+      return ()
+      )
+    -- Initialize shardValues with the identity value, if we know it.
+    -- We need the identity instead of the seed, as sharded self scheduling
+    -- does not combine all the tiles in order.
+    case identity of
+      Nothing -> return ()
+      Just i -> do
+        value <- llvmOfExp (compileArrayInstrEnvs envs) i
+        imapFromStepTo
+          []
+          (A.liftInt 0)
+          (A.liftInt 1)
+          shardAmount'
+          (\(OP_Int idx) -> do
+            OP_Int idxCacheWidth <- A.mul numType (OP_Int idx) (OP_Int cacheLineWidth'')
+            _ <- tupleStoreArray tp NonVolatile shardArray idxCacheWidth shardValueIdx value
+            return ()
           )
-        -- Initialize shardValues with the identity value, if we know it.
-        -- We need the identity instead of the seed, as sharded self scheduling
-        -- does not combine all the tiles in order.
-        case identity of
-          Nothing -> return ()
-          Just i -> do
-            value <- llvmOfExp (compileArrayInstrEnvs envs) i
-            imapFromStepTo
-              []
-              (A.liftInt 0)
-              (A.liftInt 1)
-              shardAmount'
-              (\(OP_Int idx) -> do
-                OP_Int idxCacheWidth <- A.mul numType (OP_Int idx) (A.liftInt $ fromIntegral $ valuesPerCacheLine shardType)
-                _ <- tupleStoreArray tp NonVolatile shardArray idxCacheWidth shardValueIdx value
-                return ()
-              )
   )
   -- Initialize a thread
   (\_ _ -> tupleAlloca tp)
@@ -646,94 +672,96 @@ parCodeGenFoldSharded cacheLineWidth descending fun seed input index codeEnd
     tupleStore tp accumVar new
   )
   -- Code after the tile loop
-  (\_ accumVar ptr envs -> do
-    ptrs <- tuplePtrs' memoryTp ptr
-    case ptrs of
-      TupRsingle shardArray -> do
-        let shardIdx = fromMaybe (internalError "Missing shard index") $ envsShardIdx envs
-        OP_Word64 idxCacheWidth <- A.mul numType (OP_Word64 shardIdx) (A.liftWord64 (valuesPerCacheLine shardType))
-        
-        _ <- Loop.while [] TupRunit
-          (\_ -> do
-            idx <- tupleLoadArray (TupRsingle scalarTypeInt) Volatile shardArray idxCacheWidth shardIdxIdx
-            A.neq singleType idx (envsTileIndex envs)
+  (\_ accumVar _ envs -> do
+    shardArray <- instr' $ PtrCast (PtrPrimType (ArrayPrimType 0 shardType) defaultAddrSpace) shards
+    cacheLineWidth' <- instr $ Load scalarType NonVolatile cacheLineWidth
+
+    let shardIdx = fromMaybe (internalError "Missing shard index") $ envsShardIdx envs
+    OP_Word64 idxCacheWidth <- A.mul numType (OP_Word64 shardIdx) cacheLineWidth'
+    
+    _ <- Loop.while [] TupRunit
+      (\_ -> do
+        idx <- tupleLoadArray (TupRsingle scalarTypeInt) Volatile shardArray idxCacheWidth shardIdxIdx
+        A.neq singleType idx (envsTileIndex envs)
+      )
+      (\_ -> return OP_Unit)
+      OP_Unit
+    _ <- instr' $ LLVM.Fence (CrossThread, Acquire)
+
+    local <- tupleLoad tp accumVar
+
+    new <-
+      if isNothing identity then do
+        -- If there is no identity, then write the output directly in the first tiles.
+        -- The other tiles must combine their result with the given operator.
+        -- For sharded 
+        startIdx <- tupleLoadArray (TupRsingle scalarTypeInt) NonVolatile shardArray idxCacheWidth shardStartIdxIdx
+        A.ifThenElse (tp, A.eq singleType (envsTileIndex envs) startIdx)
+          (do
+            return local
           )
-          (\_ -> return OP_Unit)
-          OP_Unit
-        _ <- instr' $ LLVM.Fence (CrossThread, Acquire)
-
-        local <- tupleLoad tp accumVar
-
-        new <-
-          if isNothing identity then do
-            -- If there is no identity, then write the output directly in the first tiles.
-            -- The other tiles must combine their result with the given operator.
-            -- For sharded 
-            startIdx <- tupleLoadArray (TupRsingle scalarTypeInt) NonVolatile shardArray idxCacheWidth shardStartIdxIdx
-            A.ifThenElse (tp, A.eq singleType (envsTileIndex envs) startIdx)
-              (do
-                return local
-              )
-              (do
-                prefix <- tupleLoadArray tp NonVolatile shardArray idxCacheWidth shardValueIdx
-                tupleStore tp accumVar prefix
-                if envsDescending envs then
-                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local prefix
-                else
-                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
-              )
-          -- If there is a seed, then all tile will combine their local result with
-          -- the already available value.
-          else do
+          (do
             prefix <- tupleLoadArray tp NonVolatile shardArray idxCacheWidth shardValueIdx
             tupleStore tp accumVar prefix
             if envsDescending envs then
               app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local prefix
             else
               app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
-        tupleStoreArray tp NonVolatile shardArray idxCacheWidth shardValueIdx new 
+          )
+      -- If there is a seed, then all tile will combine their local result with
+      -- the already available value.
+      else do
+        prefix <- tupleLoadArray tp NonVolatile shardArray idxCacheWidth shardValueIdx
+        tupleStore tp accumVar prefix
+        if envsDescending envs then
+          app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local prefix
+        else
+          app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
+    tupleStoreArray tp NonVolatile shardArray idxCacheWidth shardValueIdx new 
 
 
-        _ <- instr' $ LLVM.Fence (CrossThread, Release)
-        nextIdx <- A.add numType (envsTileIndex envs) (A.liftInt 1)
-        _ <- tupleStoreArray (TupRsingle scalarTypeInt) Volatile shardArray idxCacheWidth shardIdxIdx nextIdx
-        return ()
+    _ <- instr' $ LLVM.Fence (CrossThread, Release)
+    nextIdx <- A.add numType (envsTileIndex envs) (A.liftInt 1)
+    _ <- tupleStoreArray (TupRsingle scalarTypeInt) Volatile shardArray idxCacheWidth shardIdxIdx nextIdx
+    return ()
   )
   (\_ _ _ -> return ())
   -- Code after the loop
-  (\ptr envs -> do
-    ptrs <- tuplePtrs' memoryTp ptr
-    case ptrs of
-      TupRsingle shardArray -> do
-        let tileCount = envsTileCount envs
+  (\_ envs -> do
+    let tileCount = envsTileCount envs
 
-        loopAmount <- A.min singleType (OP_Int tileCount) (A.liftInt $ fromIntegral shardAmount)
+    shardArray <- instr' $ PtrCast (PtrPrimType (ArrayPrimType 0 shardType) defaultAddrSpace) shards
 
-        let loop idx accum = do 
-              OP_Int shardIdxCacheWidth <- A.mul numType idx (A.liftInt $ fromIntegral (valuesPerCacheLine shardType))
-              x <- tupleLoadArray tp NonVolatile shardArray shardIdxCacheWidth shardValueIdx
-              if envsDescending envs then
-                app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-              else
-                app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-        
-        -- If we have a seed, the loop might be empty, thus start from the seed.
-        -- If we do not have a seed, we assume the loop is never empty, 
-        -- thus start from the first value.
-        value <- case seed of
-          Just s -> do
-            initValue <- llvmOfExp (compileArrayInstrEnvs envs) s
-            iterFromStepTo [] tp (A.liftInt 0) (A.liftInt 1) loopAmount initValue loop
+    OP_Word64 cacheLineWidth' <- instr $ Load scalarType NonVolatile cacheLineWidth
+    cacheLineWidth'' <- instr' $ BitCast scalarType cacheLineWidth'
 
-          Nothing -> do
-            initValue <- tupleLoadArray tp NonVolatile shardArray (integral TypeWord64 0) shardValueIdx
-            iterFromStepTo [] tp (A.liftInt 1) (A.liftInt 1) loopAmount initValue loop
+    loopAmount <- A.min singleType (OP_Int tileCount) (A.liftInt $ fromIntegral shardAmount)
 
-        codeEnd envs value
+    let loop idx accum = do 
+          OP_Int shardIdxCacheWidth <- A.mul numType idx (OP_Int cacheLineWidth'')
+          x <- tupleLoadArray tp NonVolatile shardArray shardIdxCacheWidth shardValueIdx
+          if envsDescending envs then
+            app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
+          else
+            app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
+    
+    -- If we have a seed, the loop might be empty, thus start from the seed.
+    -- If we do not have a seed, we assume the loop is never empty, 
+    -- thus start from the first value.
+    value <- case seed of
+      Just s -> do
+        initValue <- llvmOfExp (compileArrayInstrEnvs envs) s
+        iterFromStepTo [] tp (A.liftInt 0) (A.liftInt 1) loopAmount initValue loop
+
+      Nothing -> do
+        initValue <- tupleLoadArray tp NonVolatile shardArray (integral TypeWord64 0) shardValueIdx
+        iterFromStepTo [] tp (A.liftInt 1) (A.liftInt 1) loopAmount initValue loop
+
+    codeEnd envs value
   )
   Nothing
   where
-    memoryTp = TupRsingle shardArray
+    memoryTp = TupRunit
     ArgArray _ (ArrayR _ tp) _ _ = input
     -- Each element of the array contains a struct storing the result value, 
     -- the current index of the shard and the start index of the shard
@@ -742,10 +770,6 @@ parCodeGenFoldSharded cacheLineWidth descending fun seed input index codeEnd
       mapTupR ScalarPrimType tp `TupRpair` 
       TupRsingle (ScalarPrimType scalarTypeInt) `TupRpair` 
       TupRsingle (ScalarPrimType scalarTypeInt)
-    -- The array size is multiplied by the cache width so that each shard 
-    -- is on a seperate cache line to avoid false sharing
-    shardArray :: PrimType (SizedArray (Struct ((e, Int), Int)))
-    shardArray = ArrayPrimType (shardAmount * valuesPerCacheLine shardType) shardType
     -- Indexes for accessing the fields from the struct stored in the array
     shardValueIdx :: TupleIdx ((e, Int), Int) e
     shardValueIdx = tupleLeft $ tupleLeft TupleIdxSelf

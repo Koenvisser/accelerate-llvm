@@ -157,6 +157,7 @@ struct KernelLaunch {
   
   uint64_t cache_line_size;
   _Atomic uint8_t *shards;
+  _Atomic uint8_t *shards_fold;
 
   uint64_t shard_sizes[SHARD_AMOUNT];
   _Atomic uint64_t index;

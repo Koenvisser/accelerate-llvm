@@ -115,26 +115,38 @@ void* accelerate_worker(void *data_packed) {
         task.program = NULL;
         task.location = 0;
       } else {
-
-        kernel->cache_line_size = get_cache_line_size();
-
-        size_t buffer_size = SHARD_AMOUNT * kernel->cache_line_size;
-        kernel->shards = aligned_alloc(kernel->cache_line_size, buffer_size);
-        memset(kernel->shards, 0, buffer_size);
-
         // Initialize kernel memory and check if the kernel should be executed in parallel.
-        unsigned char parallel =
+        unsigned char flags =
+          kernel->work_function(kernel, workers->locks, 0xFFFFFFFD);
+
+        if (((flags >> 1) & 1) == 1) {
+          kernel->cache_line_size = get_cache_line_size();
+          size_t buffer_size = SHARD_AMOUNT * kernel->cache_line_size;
+          kernel->shards = aligned_alloc(kernel->cache_line_size, buffer_size);
+          memset(kernel->shards, 0, buffer_size);
+          if (((flags >> 2) & 1) == 1) {
+            kernel->shards_fold = aligned_alloc(kernel->cache_line_size, buffer_size);
+            memset(kernel->shards_fold, 0, buffer_size);
+          }
+          else {
+            kernel->shards_fold = NULL;
+          }
           kernel->work_function(kernel, workers->locks, 0xFFFFFFFF);
+        }
+        else {
+          kernel->shards = NULL;
+          kernel->shards_fold = NULL;
+        }
 
         // start_task from the Work Assisting paper
-        if (parallel == 1) {
+        if ((flags & 1) == 1) {
           atomic_store_explicit(&workers->scheduler.activities[thread_idx], accelerate_pack(kernel, 0), memory_order_release);
           accelerate_parker_wake_all(&workers->scheduler.parker);
         }
         kernel->work_function(kernel, workers->locks, 0);
         // Keep track of whether this was the last thread working on the kernel
         bool is_last;
-        if (parallel == 1) {
+        if ((flags & 1) == 1) {
           // signal_task_empty from the Work Assisting paper,
           // and end_task
           // Note that in the paper, the work function calls this function.

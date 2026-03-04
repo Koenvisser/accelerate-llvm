@@ -49,7 +49,7 @@ shardAmount = 128
 -- We store the work function as a pointer to a struct, as that makes it easy
 -- to separate pointers to a kernel from pointers to buffers, when compiling
 -- a schedule.
-type Header = (((((((Ptr (Struct Int8), Ptr Int8), Word32), Word32), Word64), Ptr Word8), SizedArray Word64), Word64)
+type Header = ((((((((Ptr (Struct Int8), Ptr Int8), Word32), Word32), Word64), Ptr Word8), Ptr Word8), SizedArray Word64), Word64)
 
 headerType :: TupR PrimType Header
 headerType = TupRsingle (PtrPrimType (StructPrimType False $ TupRsingle primType) defaultAddrSpace)
@@ -57,6 +57,7 @@ headerType = TupRsingle (PtrPrimType (StructPrimType False $ TupRsingle primType
   `TupRpair` TupRsingle primType
   `TupRpair` TupRsingle primType
   `TupRpair` TupRsingle primType
+  `TupRpair` TupRsingle (PtrPrimType primType defaultAddrSpace)
   `TupRpair` TupRsingle (PtrPrimType primType defaultAddrSpace)
   `TupRpair` TupRsingle (ArrayPrimType shardAmount primType)
   `TupRpair` TupRsingle primType
@@ -76,6 +77,7 @@ bindHeaderEnv
   -> ( PrimType (Ptr (Struct ((Header, Struct (MarshalEnv env)), SizedArray Word)))
      , CodeGen Native ()
      , Operand (Ptr Word8)  -- work indexes of shards
+     , Operand (Ptr Word8)  -- work indexes of fold shards
      , Operand (Ptr Word64)       -- Cache line width in bytes
      , Operand (Ptr (SizedArray Word64))  -- sizes of the shards
      , Operand (Ptr Word64)               -- In the case of workassist, the workassist index.
@@ -87,15 +89,18 @@ bindHeaderEnv
 bindHeaderEnv env =
   ( argTp
   , do
-      shards <- instr' $ GetElementPtr (gepStruct (PtrPrimType primType defaultAddrSpace) arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
-      instr_ $ downcast $ nameShards'        := LoadPtr NonVolatile shards
-      instr_ $ downcast $ nameCacheLineWidth := GetElementPtr (gepStruct primType arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
+      shards <- instr' $ GetElementPtr (gepStruct (PtrPrimType primType defaultAddrSpace) arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
+      shardFold <- instr' $ GetElementPtr (gepStruct (PtrPrimType primType defaultAddrSpace) arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
+      instr_ $ downcast $ nameShards         := LoadPtr NonVolatile shards
+      instr_ $ downcast $ nameShardsFold     := LoadPtr NonVolatile shardFold
+      instr_ $ downcast $ nameCacheLineWidth := GetElementPtr (gepStruct primType arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
       instr_ $ downcast $ nameShardSizes     := GetElementPtr (gepStruct (ArrayPrimType shardAmount (ScalarPrimType scalarType)) arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
       instr_ $ downcast $ nameIndex          := GetElementPtr (gepStruct primType arg $ TupleIdxLeft $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
       instr_ $ downcast $ "env"              := GetElementPtr (gepStruct envTp arg $ TupleIdxLeft $ TupleIdxRight TupleIdxSelf)
       instr_ $ downcast $ nameKernelMemory   := GetElementPtr (gepStruct kernelMemTp arg $ TupleIdxRight TupleIdxSelf)
       extractEnv
-  , LocalReference (PrimType $ PtrPrimType primType defaultAddrSpace) nameShards'
+  , LocalReference (PrimType $ PtrPrimType primType defaultAddrSpace) nameShards
+  , LocalReference (PrimType $ PtrPrimType primType defaultAddrSpace) nameShardsFold
   , LocalReference (PrimType $ PtrPrimType primType defaultAddrSpace) nameCacheLineWidth
   , LocalReference (PrimType $ PtrPrimType (ArrayPrimType shardAmount (ScalarPrimType scalarType)) defaultAddrSpace) nameShardSizes
   , LocalReference (PrimType $ PtrPrimType (ScalarPrimType scalarType) defaultAddrSpace) nameIndex
@@ -111,7 +116,7 @@ bindHeaderEnv env =
     (envTp, extractEnv, gamma) = bindEnvFromStruct env
 
     nameShards = "workassist.shards"
-    nameShards' = "workassist.shards"
+    nameShardsFold = "workassist.shards_fold"
     nameCacheLineWidth = "workassist.cache_line_size"
     nameShardSizes = "workassist.shard_sizes"
     nameIndex = "workassist.index"
